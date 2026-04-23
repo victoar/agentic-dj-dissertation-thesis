@@ -20,6 +20,7 @@ dependencies = [
     "streamlit",
     "pydantic",
     "requests",
+    "sentence-transformers",
 ]
 
 [tool.hatch.build.targets.wheel]
