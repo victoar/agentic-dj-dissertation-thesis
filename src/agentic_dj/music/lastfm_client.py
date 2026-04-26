@@ -29,7 +29,7 @@ from agentic_dj.music.tags import estimate_features_with_fallback, TagEstimate
 load_dotenv()
 
 _network: Optional[pylast.LastFMNetwork] = None
-_cache_dir = Path(".cache/lastfm")
+_cache_dir = Path(".cache_lastfm")
 
 
 def _get_network() -> pylast.LastFMNetwork:
@@ -153,11 +153,15 @@ def enrich_track(
     """
     enr = fetch_enrichment(artist, track_name, use_cache=use_cache)
 
+    # Use Last.fm listener count as mainstream proxy (0–10M+ range)
+    # Normalise to 0–100 scale loosely comparable to Spotify popularity
+    lastfm_popularity = min(100, int(enr.listeners / 100_000)) if enr.listeners else None
+
     estimate = estimate_features_with_fallback(
         tags=enr.tags,
         tag_weights=enr.tag_weights,
         use_semantic=True,
-        popularity=None,  # we'll use Spotify popularity later
+        popularity=lastfm_popularity,
     )
 
     track = Track(
