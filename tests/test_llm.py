@@ -1,23 +1,16 @@
 import os
 import json
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 
 load_dotenv()
 
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
 
 print("=" * 45)
 print("TEST 4 — Google Gemini 3.0 Flash")
 print("=" * 45)
-
-model = genai.GenerativeModel(
-    model_name="gemini-3-flash-preview",
-    system_instruction="""You are the reasoning core of an Agentic DJ system.
-You receive the current listener state and candidate tracks,
-and select the best next track. Always respond with valid JSON only,
-no markdown, no code blocks, no extra text."""
-)
 
 prompt = """Current listener state:
 - Energy: 0.75 (building — wants more energy)
@@ -38,7 +31,16 @@ Respond with JSON only:
 
 print("\nSending prompt to Gemini 3.0 Flash...")
 
-response = model.generate_content(prompt)
+response = client.models.generate_content(
+    model="gemini-3-flash-preview",
+    contents=prompt,
+    config=types.GenerateContentConfig(
+        system_instruction="""You are the reasoning core of an Agentic DJ system.
+You receive the current listener state and candidate tracks,
+and select the best next track. Always respond with valid JSON only,
+no markdown, no code blocks, no extra text.""",
+    ),
+)
 raw = response.text.strip()
 
 print(f"\n[1] Raw response:\n      {raw}")

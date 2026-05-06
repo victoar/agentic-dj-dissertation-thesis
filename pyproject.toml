@@ -15,7 +15,7 @@ dependencies = [
     "python-dotenv",
     "anthropic",
     "openai",
-    "google-generativeai",
+    "google-genai",
     "langchain",
     "langgraph",
     "music21",
