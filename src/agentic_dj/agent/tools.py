@@ -248,6 +248,11 @@ def search_tracks(
 
     candidates = []
     for sp_track in results:
+        # Skip tracks already played this session before enriching
+        if sp_track.id in _queued_ids:
+            continue
+        if sp_track.name.lower() in _queued_names:
+            continue
         candidate = _spotify_to_candidate(sp_track, enrich=enrich)
         candidates.append(candidate)
 
@@ -314,6 +319,9 @@ def get_current_playback() -> dict:
 #  4. QUEUE TOOLS
 # ════════════════════════════════════════════════════════════════════════════
 
+_queued_ids:   set[str] = set()    # track ids queued this session — never repeat
+_queued_names: set[str] = set()    # lowercase names as backup when id is unavailable
+
 def add_track_to_queue(track_name: str, artist: str) -> dict:
     """
     Search for a track and add it to the Spotify playback queue.
@@ -335,12 +343,31 @@ def add_track_to_queue(track_name: str, artist: str) -> dict:
         return {"success": False, "error": f"Could not find '{track_name}' by {artist}"}
 
     sp_track = results[0]
-    success  = _spotify.add_to_queue(sp_track)
+
+    if sp_track.id in _queued_ids:
+        return {
+            "success":   False,
+            "duplicate": True,
+            "error":     f"'{sp_track.name}' by {sp_track.artist} was already "
+                         f"played in this session — skipping.",
+        }
+
+    # Fallback name check for edge cases where id might differ
+    if sp_track.name.lower() in _queued_names:
+        return {
+            "success":   False,
+            "duplicate": True,
+            "error":     f"'{sp_track.name}' was already played in this session.",
+        }
+
+    success = _spotify.add_to_queue(sp_track)
 
     if success:
         candidate = _spotify_to_candidate(sp_track, enrich=True)
         _queue.append(sp_track)
         _history.append(candidate)
+        _queued_ids.add(sp_track.id)
+        _queued_names.add(sp_track.name.lower())
         _state = advance_track(_state, Track(
             id=sp_track.id,
             name=sp_track.name,
@@ -354,7 +381,7 @@ def add_track_to_queue(track_name: str, artist: str) -> dict:
     else:
         return {
             "success": False,
-            "error":   "No active Spotify device. Open Spotify on a device first.",
+            "error":   "No active Spotify device.",
         }
 
 
@@ -396,8 +423,9 @@ def reset_session(context: str = "general") -> dict:
     Args:
         context: one of study, workout, party, focus, chill, general
 
-    Clears the queue and history, re-initialises the state vector with
-    presets appropriate for the declared context.
+    Resets the listener state vector, arc, queue, and play history.
+    The played-track guard (_queued_ids, _queued_names) is intentionally
+    preserved so a track cannot be replayed even across context switches.
     """
     global _state, _queue, _history
     _state   = init_state(context)
