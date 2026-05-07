@@ -184,7 +184,7 @@ def render(state: dict | None = None):
             "Energy arc — session trajectory</p>",
             unsafe_allow_html=True,
         )
-        st.plotly_chart(_arc_chart(data), use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(_arc_chart(data), width="stretch", config={"displayModeBar": False})
 
         st.markdown(
             "<p style='font-size:0.8rem;color:#888;margin-top:-10px;'>"

@@ -92,11 +92,10 @@ def _divider() -> str:
 def render(trace: list | None = None, current_track: str = "Midnight City"):
     """
     Render the Agent Trace tab.
-    trace: list of dicts with 'kind' and 'content' keys, or None for mock data.
+    trace: list of dicts with 'kind' and 'content' keys.
+           Pass None or [] to show the empty state.
     current_track: name of the track the agent was selecting for (used in the heading).
     """
-    items = trace or MOCK_TRACE
-
     with st.container(border=True):
         st.markdown(
             f"<p style='font-size:0.9rem;color:#444;margin-bottom:4px;'>"
@@ -104,8 +103,12 @@ def render(trace: list | None = None, current_track: str = "Midnight City"):
             unsafe_allow_html=True,
         )
 
+        if not trace:
+            st.caption("No trace yet. Press a feedback button to run the agent.")
+            return
+
         rows_html = ""
-        for i, entry in enumerate(items):
+        for i, entry in enumerate(trace):
             if i > 0:
                 rows_html += _divider()
             rows_html += _trace_row(entry)
