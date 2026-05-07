@@ -30,3 +30,8 @@ SPOTIPY_CLIENT_ID=
 SPOTIPY_REDIRECT_URI=
 LASTFM_API_KEY=
 ```
+
+## Run the Streamlit app (requires .env populated)
+```
+streamlit run app/app.py
+```

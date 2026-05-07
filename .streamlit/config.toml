@@ -1,0 +1,7 @@
+[server]
+# Disable file watcher entirely.
+# Even watchdog mode scans sys.modules to discover source files, which triggers
+# transformers' lazy __getattr__ → zoedepth → torchvision (not installed).
+# None is the only mode that skips the module scan. Restart the server manually
+# after code changes.
+fileWatcherType = "none"

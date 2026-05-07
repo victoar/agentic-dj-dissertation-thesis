@@ -8,6 +8,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Install (editable install from src layout)
 pip install -e .
 
+# Run the Streamlit app (requires .env populated)
+streamlit run app/app.py
+
 # Run all tests
 pytest
 
