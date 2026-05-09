@@ -22,8 +22,10 @@ dependencies = [
     "streamlit",
     "pydantic",
     "requests",
-    "sentence-transformers",
 ]
+
+[project.optional-dependencies]
+full = ["sentence-transformers"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agentic_dj"]

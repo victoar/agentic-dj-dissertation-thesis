@@ -14,13 +14,21 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import streamlit as st
-import agentic_dj.agent.tools as tool_module
-from agentic_dj.agent.loop import run_agent_cycle
+
+try:
+    import agentic_dj.agent.tools as tool_module
+    from agentic_dj.agent.loop import run_agent_cycle
+    _agent_available = True
+except Exception:
+    _agent_available = False
 
 
 def init_session() -> None:
     """Initialise session state keys on first load."""
     if "initialised" in st.session_state:
+        return
+    if not _agent_available:
+        st.session_state.initialised = False
         return
     try:
         st.session_state.current_playback = tool_module.get_current_playback()
