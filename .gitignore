@@ -5,4 +5,5 @@ __pycache__/
 .DS_Store
 .cache
 .cache_lastfm/
+.cache_deezer/
 streamlit_interface/

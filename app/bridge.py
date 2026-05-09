@@ -22,13 +22,16 @@ def init_session() -> None:
     """Initialise session state keys on first load."""
     if "initialised" in st.session_state:
         return
-    st.session_state.current_playback = tool_module.get_current_playback()
-    st.session_state.listener_state   = tool_module.get_listener_state()
-    st.session_state.queue_state      = tool_module.get_queue_state()
-    st.session_state.session_history  = tool_module.get_session_history()
-    st.session_state.last_trace       = []
-    st.session_state.last_explanation = ""
-    st.session_state.initialised      = True
+    try:
+        st.session_state.current_playback = tool_module.get_current_playback()
+        st.session_state.listener_state   = tool_module.get_listener_state()
+        st.session_state.queue_state      = tool_module.get_queue_state()
+        st.session_state.session_history  = tool_module.get_session_history()
+        st.session_state.last_trace       = []
+        st.session_state.last_explanation = ""
+        st.session_state.initialised      = True
+    except Exception:
+        st.session_state.initialised = False
 
 
 def refresh() -> None:
@@ -53,11 +56,12 @@ def adapt_now_playing() -> dict:
     name   = playback.get("track_name", "")
     artist = playback.get("artist", "")
 
-    energy_est, valence_est = 0.5, 0.5
+    energy_est, valence_est, bpm = 0.5, 0.5, None
     for entry in history.get("recent", []):
         if entry.get("name", "").lower() == name.lower():
             energy_est  = entry.get("energy_est",  0.5)
             valence_est = entry.get("valence_est", 0.5)
+            bpm         = entry.get("bpm")
             break
 
     return {
@@ -66,7 +70,7 @@ def adapt_now_playing() -> dict:
         "album":       playback.get("album", ""),
         "energy_est":  energy_est,
         "valence_est": valence_est,
-        "bpm":         None,
+        "bpm":         bpm,
         "key":         None,
         "progress_ms": playback.get("progress_ms", 0),
         "duration_ms": playback.get("duration_ms", 1),
@@ -112,7 +116,7 @@ def adapt_queue() -> tuple[dict, list]:
         queue_items.append({
             "name":   item["name"],
             "artist": item["artist"],
-            "bpm":    None,
+            "bpm":    hist_entry.get("bpm") or None,
             "key":    None,
             "energy": hist_entry.get("energy_est") or None,
             "note":   "",

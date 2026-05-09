@@ -29,6 +29,7 @@ from agentic_dj.music.camelot import (
 )
 from agentic_dj.music.tags import estimate_features_with_fallback
 from agentic_dj.music.lastfm_client import enrich_track, fetch_enrichment
+from agentic_dj.music.deezer_client import fetch_bpm
 from agentic_dj.spotify.client import SpotifyClient, SpotifyTrack
 
 
@@ -477,6 +478,11 @@ def _spotify_to_candidate(sp_track: SpotifyTrack, enrich: bool = True) -> dict:
                 "confidence":  estimate.confidence,
                 "listeners":   enr.listeners,
             })
+
+        bpm_result = fetch_bpm(sp_track.artist, sp_track.name)
+        candidate["bpm"] = bpm_result["bpm"]
+
+    candidate["key"] = None
 
     return candidate
 

@@ -12,6 +12,11 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
+st.sidebar.markdown(
+    "BPM & key data: [GetSongKey](https://getsongkey.com)",
+    unsafe_allow_html=True,
+)
+
 st.markdown("""
 <style>
     [data-testid="collapsedControl"] { display: none; }
@@ -25,6 +30,13 @@ st.markdown("""
 bridge.init_session()
 
 st.markdown("## The practical application")
+
+if not st.session_state.get("initialised"):
+    st.info(
+        "Spotify is not connected. Run the app locally with valid credentials in `.env` to start a session.",
+        icon="ℹ️",
+    )
+    st.stop()
 
 tab_now, tab_state, tab_queue, tab_trace = st.tabs([
     "Now playing", "Listener state", "Queue", "Agent trace"
