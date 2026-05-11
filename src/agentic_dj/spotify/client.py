@@ -91,6 +91,7 @@ class SpotifyClient:
         """
         sp = self._get_sp()
         results = sp.search(q=query, limit=limit, type="track")
+        print(query)
         tracks  = results.get("tracks", {}).get("items", [])
         return [self._parse_track(t) for t in tracks if t]
 

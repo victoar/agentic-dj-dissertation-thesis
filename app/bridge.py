@@ -14,21 +14,32 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import streamlit as st
-import agentic_dj.agent.tools as tool_module
-from agentic_dj.agent.loop import run_agent_cycle
+
+try:
+    import agentic_dj.agent.tools as tool_module
+    from agentic_dj.agent.loop import run_agent_cycle
+    _agent_available = True
+except Exception:
+    _agent_available = False
 
 
 def init_session() -> None:
     """Initialise session state keys on first load."""
     if "initialised" in st.session_state:
         return
-    st.session_state.current_playback = tool_module.get_current_playback()
-    st.session_state.listener_state   = tool_module.get_listener_state()
-    st.session_state.queue_state      = tool_module.get_queue_state()
-    st.session_state.session_history  = tool_module.get_session_history()
-    st.session_state.last_trace       = []
-    st.session_state.last_explanation = ""
-    st.session_state.initialised      = True
+    if not _agent_available:
+        st.session_state.initialised = False
+        return
+    try:
+        st.session_state.current_playback = tool_module.get_current_playback()
+        st.session_state.listener_state   = tool_module.get_listener_state()
+        st.session_state.queue_state      = tool_module.get_queue_state()
+        st.session_state.session_history  = tool_module.get_session_history()
+        st.session_state.last_trace       = []
+        st.session_state.last_explanation = ""
+        st.session_state.initialised      = True
+    except Exception:
+        st.session_state.initialised = False
 
 
 def refresh() -> None:
@@ -53,11 +64,13 @@ def adapt_now_playing() -> dict:
     name   = playback.get("track_name", "")
     artist = playback.get("artist", "")
 
-    energy_est, valence_est = 0.5, 0.5
+    energy_est, valence_est, bpm, camelot = 0.5, 0.5, None, None
     for entry in history.get("recent", []):
         if entry.get("name", "").lower() == name.lower():
             energy_est  = entry.get("energy_est",  0.5)
             valence_est = entry.get("valence_est", 0.5)
+            bpm         = entry.get("bpm")
+            camelot     = entry.get("camelot_position")
             break
 
     return {
@@ -66,8 +79,8 @@ def adapt_now_playing() -> dict:
         "album":       playback.get("album", ""),
         "energy_est":  energy_est,
         "valence_est": valence_est,
-        "bpm":         None,
-        "key":         None,
+        "bpm":         bpm,
+        "key":         camelot,
         "progress_ms": playback.get("progress_ms", 0),
         "duration_ms": playback.get("duration_ms", 1),
         "reasoning":   explanation or "Waiting for first agent cycle…",
@@ -112,8 +125,8 @@ def adapt_queue() -> tuple[dict, list]:
         queue_items.append({
             "name":   item["name"],
             "artist": item["artist"],
-            "bpm":    None,
-            "key":    None,
+            "bpm":    hist_entry.get("bpm") or None,
+            "key":    hist_entry.get("camelot_position") or None,
             "energy": hist_entry.get("energy_est") or None,
             "note":   "",
         })
