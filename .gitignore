@@ -6,4 +6,5 @@ __pycache__/
 .cache
 .cache_lastfm/
 .cache_deezer/
+.cache_getsongkey/
 streamlit_interface/

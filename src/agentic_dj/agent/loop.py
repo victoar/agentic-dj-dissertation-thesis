@@ -15,6 +15,7 @@ It selects and sequences them autonomously based on the situation.
 
 import json
 import os
+import time
 from typing import Any
 
 from google import genai
@@ -22,9 +23,12 @@ from google.genai import types
 from dotenv import load_dotenv
 
 from agentic_dj.agent import tools as tool_module
+from agentic_dj.music.camelot import parse as camelot_parse, compatibility_strength
 
 load_dotenv()
 client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+
+DISPLAY_LOGS: bool = True   # flip to True to see the full recommendation trace
 
 
 # ── System prompt ─────────────────────────────────────────────────────────────
@@ -257,12 +261,24 @@ def _best_fallback(
     target_valence = state.get("valence", 0.5)
 
     def score(c: dict) -> float:
-        e_diff = abs(c.get("energy_est",  0.5) - target_energy)
-        v_diff = abs(c.get("valence_est", 0.5) - target_valence)
-        bpm_penalty = 0.2 if not c.get("bpm_ok", True) else 0.0
-        return e_diff + v_diff + bpm_penalty   # lower = better
+        e_diff          = abs(c.get("energy_est",  0.5) - target_energy)
+        v_diff          = abs(c.get("valence_est", 0.5) - target_valence)
+        bpm_penalty     = 0.2 if not c.get("bpm_ok",     True) else 0.0
+        camelot_penalty = 0.2 if not c.get("camelot_ok", True) else 0.0
+        return e_diff + v_diff + bpm_penalty + camelot_penalty   # lower = better
 
-    return min(candidates, key=score)
+    scored = sorted(candidates, key=score)
+
+    if DISPLAY_LOGS:
+        print("\n[fallback] Scored candidates:")
+        for c in scored[:6]:
+            s = score(c)
+            bpm_sym = "✓" if c.get("bpm_ok", True) else "✗"
+            cam_sym = "✓" if c.get("camelot_ok", True) else "✗"
+            print(f"  {s:.2f} — {c['name']} — {c['artist']}  (bpm={bpm_sym}  key={cam_sym})")
+        print(f"  → Best: {scored[0]['name']} — {scored[0]['artist']}")
+
+    return scored[0]
 
 def run_agent_cycle(
     feedback_event:  str | None = None,
@@ -275,6 +291,7 @@ def run_agent_cycle(
     one Gemini call to reason and select the next track.
     """
     trace: list[dict] = []
+    tool_module.DISPLAY_LOGS = DISPLAY_LOGS
 
     # ── Step 1: Apply feedback if provided ───────────────────
     if feedback_event and feedback_track and feedback_artist:
@@ -352,22 +369,23 @@ def run_agent_cycle(
     if verbose:
         print(f"[observe] Found {len(candidates)} candidates")
 
+    if DISPLAY_LOGS:
+        print(f"\n[candidates] {len(candidates)} tracks found:")
+        for i, c in enumerate(candidates, 1):
+            bpm = c.get("bpm") or "—"
+            key = c.get("camelot_position") or "—"
+            print(f"  {i:2}. {c['name']} — {c['artist']}  (BPM={bpm}  Key={key})")
+
     # ── Step 4: Check compatibility for each candidate ───────
     if verbose:
         print("[observe] Checking compatibility...")
 
-    current_bpm = None
-    hist_items  = history.get("recent", [])
-    if hist_items:
-        current_bpm = hist_items[0].get("bpm", 120)
+    hist_items   = history.get("recent", [])
+    current_bpm  = hist_items[0].get("bpm") if hist_items else None
+    current_camelot = hist_items[0].get("camelot_position") if hist_items else None
 
-    if playback.get("playing") and playback.get("track_name"):
-        # Try to get the current track's Camelot position from history
-        hist_items = history.get("recent", [])
-        if hist_items:
-            # Use last played track's data
-            last = hist_items[0]
-            current_bpm = last.get("bpm", 120)
+    if DISPLAY_LOGS:
+        print(f"\n[compare loop] current track BPM={current_bpm or '—'}  Key={current_camelot or '—'}")
 
     # Add compatibility scores to each candidate
     enriched_candidates = []
@@ -379,11 +397,40 @@ def run_agent_cycle(
             bpm_check = tool_module.estimate_bpm_compatibility(
                 current_bpm, c["bpm"], arc["arc_phase"]
             )
-            enriched["bpm_ok"] = bpm_check["acceptable"]
+            enriched["bpm_ok"]   = bpm_check["acceptable"]
             enriched["bpm_diff"] = bpm_check["difference"]
         else:
             enriched["bpm_ok"]   = True
             enriched["bpm_diff"] = 0
+
+        # Camelot (harmonic) compatibility
+        current_key   = camelot_parse(current_camelot or "")
+        candidate_key = camelot_parse(c.get("camelot_position") or "")
+        if current_key and candidate_key:
+            score = compatibility_strength(current_key, candidate_key)
+            enriched["camelot_ok"]    = score >= 0.4
+            enriched["camelot_score"] = round(score, 2)
+        else:
+            enriched["camelot_ok"]    = True   # unknown key — no penalty
+            enriched["camelot_score"] = None
+
+        if DISPLAY_LOGS:
+            bpm_sym = "✓" if enriched["bpm_ok"] else "✗"
+            cam_sym = "✓" if enriched["camelot_ok"] else "✗"
+            print(f"\n  [compare] {c['name']} — {c['artist']}")
+            if current_bpm and c.get("bpm"):
+                print(f"    BPM    : {current_bpm} → {c['bpm']}  diff={enriched['bpm_diff']}  ok={bpm_sym}")
+            else:
+                print(f"    BPM    : unknown (no penalty)")
+            if enriched.get("camelot_score") is not None:
+                print(f"    Key    : {current_camelot} → {c.get('camelot_position')}  "
+                      f"score={enriched['camelot_score']}  ok={cam_sym}")
+            else:
+                print(f"    Key    : unknown (no penalty)")
+            e_dist = abs(c.get("energy_est", 0.5) - state.get("energy", 0.5))
+            v_dist = abs(c.get("valence_est", 0.5) - state.get("valence", 0.5))
+            print(f"    Energy : |{state.get('energy', 0.5):.2f} - {c.get('energy_est', 0.5):.2f}| = {e_dist:.2f}")
+            print(f"    Valence: |{state.get('valence', 0.5):.2f} - {c.get('valence_est', 0.5):.2f}| = {v_dist:.2f}")
 
         enriched_candidates.append(enriched)
 
@@ -437,10 +484,9 @@ INSTRUCTIONS:
 
     try:
         raw = _call_gemini_with_retry(
-        prompt=prompt,
-        system="You are an expert DJ assistant. Always respond with valid JSON only.",
+            prompt=prompt,
+            system="You are an expert DJ assistant. Always respond with valid JSON only.",
         )
-        print(f"\n[gemini raw] {raw[:400]}")   # temporary — remove after debugging
         raw         = raw.replace("```json", "").replace("```", "").strip()
         selection   = json.loads(raw)
 
@@ -448,9 +494,13 @@ INSTRUCTIONS:
         valid_names = {c["name"].lower() for c in fresh_candidates}
         if selection.get("selected_name", "").lower() not in valid_names:
             raise ValueError(f"Gemini selected unknown track: {selection.get('selected_name')}")
-        
+
+        if DISPLAY_LOGS:
+            print(f"\n[selected] Gemini → \"{selection['selected_name']}\" by {selection['selected_artist']}")
+            print(f"  Reasoning: {selection.get('reasoning', '')[:200]}")
+
     except Exception as e:
-        if verbose:
+        if verbose or DISPLAY_LOGS:
             print(f"[fallback] Gemini parse failed ({e}) — using scored fallback")
         best = _best_fallback(fresh_candidates, state)
         if not best:

@@ -64,12 +64,13 @@ def adapt_now_playing() -> dict:
     name   = playback.get("track_name", "")
     artist = playback.get("artist", "")
 
-    energy_est, valence_est, bpm = 0.5, 0.5, None
+    energy_est, valence_est, bpm, camelot = 0.5, 0.5, None, None
     for entry in history.get("recent", []):
         if entry.get("name", "").lower() == name.lower():
             energy_est  = entry.get("energy_est",  0.5)
             valence_est = entry.get("valence_est", 0.5)
             bpm         = entry.get("bpm")
+            camelot     = entry.get("camelot_position")
             break
 
     return {
@@ -79,7 +80,7 @@ def adapt_now_playing() -> dict:
         "energy_est":  energy_est,
         "valence_est": valence_est,
         "bpm":         bpm,
-        "key":         None,
+        "key":         camelot,
         "progress_ms": playback.get("progress_ms", 0),
         "duration_ms": playback.get("duration_ms", 1),
         "reasoning":   explanation or "Waiting for first agent cycle…",
@@ -125,7 +126,7 @@ def adapt_queue() -> tuple[dict, list]:
             "name":   item["name"],
             "artist": item["artist"],
             "bpm":    hist_entry.get("bpm") or None,
-            "key":    None,
+            "key":    hist_entry.get("camelot_position") or None,
             "energy": hist_entry.get("energy_est") or None,
             "note":   "",
         })

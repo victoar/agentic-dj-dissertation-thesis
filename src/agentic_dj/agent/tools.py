@@ -29,7 +29,7 @@ from agentic_dj.music.camelot import (
 )
 from agentic_dj.music.tags import estimate_features_with_fallback
 from agentic_dj.music.lastfm_client import enrich_track, fetch_enrichment
-from agentic_dj.music.deezer_client import fetch_bpm
+from agentic_dj.music.getsongkey_client import fetch_track_info
 from agentic_dj.spotify.client import SpotifyClient, SpotifyTrack
 
 
@@ -38,6 +38,8 @@ _spotify = SpotifyClient()
 _queue:   list[SpotifyTrack] = []
 _state:   ListenerState      = init_state("general")
 _history: list[dict]         = []   # every track played this session
+
+DISPLAY_LOGS: bool = False   # synced from loop.py at the start of each cycle
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -479,10 +481,17 @@ def _spotify_to_candidate(sp_track: SpotifyTrack, enrich: bool = True) -> dict:
                 "listeners":   enr.listeners,
             })
 
-        bpm_result = fetch_bpm(sp_track.artist, sp_track.name)
-        candidate["bpm"] = bpm_result["bpm"]
+        info = fetch_track_info(sp_track.artist, sp_track.name)
+        candidate["bpm"]              = info["bpm"]
+        candidate["camelot_position"] = info["camelot_position"]
 
-    candidate["key"] = None
+        if DISPLAY_LOGS:
+            status  = "found" if info["found"] else "miss "
+            bpm_str = f"BPM={candidate['bpm']}" if candidate.get("bpm") else "BPM=—"
+            key_str = f"Key={candidate['camelot_position']}" if candidate.get("camelot_position") else "Key=—"
+            print(f"  [getsongkey/{status}] {sp_track.artist} — {sp_track.name}  →  {bpm_str}  {key_str}")
+
+    candidate["key"] = candidate.get("camelot_position")
 
     return candidate
 
