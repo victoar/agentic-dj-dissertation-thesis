@@ -33,6 +33,7 @@ SCOPES = " ".join([
     "user-modify-playback-state",
     "user-read-currently-playing",
     "user-library-read",
+    "user-library-modify",
 ])
 
 
@@ -214,6 +215,33 @@ class SpotifyClient:
             return True
         except spotipy.SpotifyException:
             return False
+
+    def seek_to_beginning(self) -> bool:
+        """Restart the current track from position 0. Returns True on success."""
+        sp = self._get_sp()
+        try:
+            sp.seek_track(0)
+            return True
+        except spotipy.SpotifyException:
+            return False
+
+    def save_track(self, track_id: str) -> bool:
+        """Save a track to the user's Spotify library. Returns True on success."""
+        sp = self._get_sp()
+        try:
+            sp.current_user_saved_tracks_add([track_id])
+            return True
+        except spotipy.SpotifyException:
+            return False
+
+    def get_spotify_queue(self) -> list[str]:
+        """Return track IDs currently in Spotify's actual queue (excludes currently playing)."""
+        sp = self._get_sp()
+        try:
+            data = sp.queue()
+            return [t["id"] for t in data.get("queue", []) if t.get("id")]
+        except spotipy.SpotifyException:
+            return []
 
     # ── User library ─────────────────────────────────────────────────────
 

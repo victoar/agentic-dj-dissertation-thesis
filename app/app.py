@@ -46,7 +46,10 @@ tab_now, tab_state, tab_queue, tab_trace = st.tabs([
 with tab_now:
     @st.fragment(run_every=5)
     def now_playing_fragment():
-        bridge.refresh_playback()
+        changed = bridge.detect_and_handle_track_change()
+        if changed:
+            bridge.ensure_buffer(2)
+
         if st.session_state.current_playback.get("playing"):
             render_now_playing(
                 track=bridge.adapt_now_playing(),
