@@ -35,9 +35,10 @@ from agentic_dj.spotify.client import SpotifyClient, SpotifyTrack
 
 # ── Shared instances (one per session) ──────────────────────────────────────
 _spotify = SpotifyClient()
-_queue:   list[SpotifyTrack] = []
-_state:   ListenerState      = init_state("general")
-_history: list[dict]         = []   # every track played this session
+_queue:     list[SpotifyTrack] = []
+_state:     ListenerState      = init_state("general")
+_history:   list[dict]         = []   # every track played this session
+_lookahead: list[str]          = []   # track IDs queued ahead but not yet playing
 
 DISPLAY_LOGS: bool = False   # synced from loop.py at the start of each cycle
 
@@ -368,6 +369,7 @@ def add_track_to_queue(track_name: str, artist: str) -> dict:
     if success:
         candidate = _spotify_to_candidate(sp_track, enrich=True)
         _queue.append(sp_track)
+        _lookahead.append(sp_track.id)
         _history.append(candidate)
         _queued_ids.add(sp_track.id)
         _queued_names.add(sp_track.name.lower())
@@ -419,6 +421,27 @@ def get_session_history() -> dict:
     }
 
 
+def get_lookahead_depth() -> int:
+    """Return the number of tracks currently buffered ahead of the playing track."""
+    return len(_lookahead)
+
+
+def consume_lookahead_up_to(track_id: str) -> int:
+    """
+    Mark `track_id` (and every track before it) as consumed — it is now playing.
+    Handles out-of-band skips: if the user jumped two tracks ahead, both are
+    removed in one call.
+    Returns the number of slots freed (0 if track_id not found in lookahead).
+    """
+    global _lookahead
+    if track_id not in _lookahead:
+        return 0
+    idx = _lookahead.index(track_id)
+    freed = idx + 1
+    _lookahead = _lookahead[idx + 1:]
+    return freed
+
+
 def reset_session(context: str = "general") -> dict:
     """
     Reset the session state for a new listening context.
@@ -430,10 +453,11 @@ def reset_session(context: str = "general") -> dict:
     The played-track guard (_queued_ids, _queued_names) is intentionally
     preserved so a track cannot be replayed even across context switches.
     """
-    global _state, _queue, _history
-    _state   = init_state(context)
-    _queue   = []
-    _history = []
+    global _state, _queue, _history, _lookahead
+    _state     = init_state(context)
+    _queue     = []
+    _history   = []
+    _lookahead = []
     return {
         "reset":   True,
         "context": context,

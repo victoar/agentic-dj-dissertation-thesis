@@ -114,6 +114,48 @@ def run_tests():
         print(f"      not a saved song")
 
 
+    # ── Test 8: seek_to_beginning ────────────────────────────
+    print("\n[8] seek_to_beginning")
+    state = client.get_playback()
+    if state and state.is_playing:
+        ok = client.seek_to_beginning()
+        check("seek_to_beginning returns True", ok is True, got=ok)
+        state_after = client.get_playback()
+        if state_after:
+            check("progress_ms is near 0 after seek",
+                  state_after.progress_ms < 3_000,
+                  got=state_after.progress_ms)
+    else:
+        print("      No active playback — seek test skipped")
+        check("seek_to_beginning skipped gracefully (no exception)", True)
+
+    # ── Test 9: save_track ───────────────────────────────────
+    print("\n[9] save_track")
+    results = client.search("Mr Brightside The Killers", limit=1)
+    if results:
+        track_id = results[0].id
+        already_saved = client.is_saved(track_id)
+        ok = client.save_track(track_id)
+        check("save_track returns True", ok is True, got=ok)
+        check("track is now saved in library", client.is_saved(track_id) is True)
+        if already_saved:
+            print(f"      Track was already saved — save_track is idempotent")
+        else:
+            print(f"      Saved: {results[0].name} — {results[0].artist}")
+    else:
+        print("      Search returned no results — save_track test skipped")
+        check("save_track skipped gracefully (no exception)", True)
+
+    # ── Test 10: get_spotify_queue ───────────────────────────
+    print("\n[10] get_spotify_queue")
+    queue_ids = client.get_spotify_queue()
+    check("get_spotify_queue returns a list", isinstance(queue_ids, list))
+    check("all queue entries are non-empty strings",
+          all(isinstance(qid, str) and qid for qid in queue_ids))
+    print(f"      {len(queue_ids)} track(s) currently in Spotify queue")
+    if queue_ids:
+        print(f"      First queued ID: {queue_ids[0]}")
+
     # ── Summary ──────────────────────────────────────────────
     print(f"\n{'='*55}")
     print(f"Results: {passed} passed  {failed} failed")

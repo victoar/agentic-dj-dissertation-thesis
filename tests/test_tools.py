@@ -3,6 +3,7 @@ Agent tools tests.
 Tests each tool function in isolation before wiring them into the agent loop.
 """
 
+import agentic_dj.agent.tools as tool_module
 from agentic_dj.agent.tools import (
     get_listener_state,
     update_listener_state,
@@ -16,6 +17,8 @@ from agentic_dj.agent.tools import (
     get_queue_state,
     get_session_history,
     reset_session,
+    get_lookahead_depth,
+    consume_lookahead_up_to,
 )
 
 
@@ -167,6 +170,60 @@ def run_tests():
     check("queue_size starts at 0", q["queue_size"] == 0)
     h = get_session_history()
     check("history starts empty",   h["tracks_played"] == 0)
+
+    # ── 12. get_lookahead_depth ──────────────────────────────
+    print("\n[12] get_lookahead_depth")
+    reset_session("general")
+    check("depth is 0 after reset", get_lookahead_depth() == 0,
+          got=get_lookahead_depth())
+
+    tool_module._lookahead = ["id1", "id2"]
+    check("depth reflects manual seed of 2", get_lookahead_depth() == 2,
+          got=get_lookahead_depth())
+
+    reset_session("general")
+    check("depth is 0 again after second reset", get_lookahead_depth() == 0,
+          got=get_lookahead_depth())
+
+    # ── 13. consume_lookahead_up_to ──────────────────────────
+    print("\n[13] consume_lookahead_up_to")
+
+    # Normal single-step consumption (track at front)
+    tool_module._lookahead = ["id1", "id2", "id3"]
+    freed = consume_lookahead_up_to("id1")
+    check("consumes first entry: freed=1",      freed == 1, got=freed)
+    check("lookahead shrinks to 2",             get_lookahead_depth() == 2,
+          got=get_lookahead_depth())
+    check("remaining entries are correct",
+          tool_module._lookahead == ["id2", "id3"],
+          got=tool_module._lookahead)
+
+    # Out-of-band skip: user jumped straight to id3
+    freed = consume_lookahead_up_to("id3")
+    check("out-of-band skip: freed=2",          freed == 2, got=freed)
+    check("lookahead is now empty",             get_lookahead_depth() == 0,
+          got=get_lookahead_depth())
+
+    # Unknown track ID — should be a no-op
+    tool_module._lookahead = ["id1", "id2"]
+    freed = consume_lookahead_up_to("unknown")
+    check("unknown id: freed=0",                freed == 0, got=freed)
+    check("lookahead unchanged after no-op",    get_lookahead_depth() == 2,
+          got=get_lookahead_depth())
+
+    # Empty lookahead — should not raise
+    tool_module._lookahead = []
+    freed = consume_lookahead_up_to("id1")
+    check("empty lookahead: freed=0",           freed == 0, got=freed)
+
+    # ── 14. reset_session clears _lookahead ─────────────────
+    print("\n[14] reset_session clears _lookahead")
+    tool_module._lookahead = ["id1", "id2", "id3"]
+    reset_session("focus")
+    check("reset clears lookahead",  get_lookahead_depth() == 0,
+          got=get_lookahead_depth())
+    check("reset sets correct context",
+          get_session_arc()["arc_phase"] == "warmup")
 
     # ── Summary ──────────────────────────────────────────────
     print(f"\n{'='*55}")
