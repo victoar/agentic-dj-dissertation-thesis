@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 
 from agentic_dj.agent import tools as tool_module
 from agentic_dj.music.camelot import parse as camelot_parse, compatibility_strength
+from agentic_dj.music import lastfm_client
 
 load_dotenv()
 client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
@@ -338,17 +339,21 @@ def run_agent_cycle(
     if verbose:
         print("[observe] Searching for candidates...")
 
-    # Build search query from state
-    energy_word  = "energetic upbeat" if state["energy"] > 0.6 else "calm relaxing"
-    valence_word = "happy positive"   if state["valence"] > 0.6 else "melancholic dark"
-    query        = f"{energy_word} {valence_word}"
+    current_track_id = playback.get("track_id", "")
+    current_artist   = playback.get("artist", "").lower()
 
-    # Also search based on current track artist for continuity
-    searches = [tool_module.search_tracks(query, limit=5)]
-    if playback.get("artist"):
-        searches.append(
-            tool_module.search_tracks(playback["artist"], limit=3)
-        )
+    # Use Last.fm similar artists as search seeds for stylistically relevant results.
+    # Fall back to a mood query if the current artist is unknown or Last.fm returns nothing.
+    similar_artists = lastfm_client.get_similar_artists(current_artist, limit=5) if current_artist else []
+
+    if similar_artists:
+        searches = [tool_module.search_tracks(f"artist:{a}", limit=2) for a in similar_artists]
+        query_desc = f"similar artists: {', '.join(similar_artists)}"
+    else:
+        energy_word  = "energetic upbeat" if state["energy"] > 0.6 else "calm relaxing"
+        valence_word = "happy positive"   if state["valence"] > 0.6 else "melancholic dark"
+        searches     = [tool_module.search_tracks(f"{energy_word} {valence_word}", limit=8)]
+        query_desc   = f"{energy_word} {valence_word}"
 
     all_candidates = []
     for s in searches:
@@ -362,9 +367,17 @@ def run_agent_cycle(
             seen.add(c["id"])
             candidates.append(c)
 
+    # Exclude the currently playing track and all tracks by the same artist
+    if current_artist:
+        candidates = [
+            c for c in candidates
+            if c["id"] != current_track_id
+            and c["artist"].lower() != current_artist
+        ]
+
     trace.append(_make_trace_entry(step=2, kind="observe",
         content=f"Found {len(candidates)} candidates",
-        tool_result={"count": len(candidates), "query": query}))
+        tool_result={"count": len(candidates), "query": query_desc}))
 
     if verbose:
         print(f"[observe] Found {len(candidates)} candidates")

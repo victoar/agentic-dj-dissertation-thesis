@@ -178,6 +178,32 @@ def enrich_track(
     return track, estimate
 
 
+def get_similar_artists(artist: str, limit: int = 5, use_cache: bool = True) -> list[str]:
+    """
+    Return up to `limit` artist names similar to `artist` according to Last.fm.
+    Returns [] if the artist is not found or the API fails.
+    Results are disk-cached using the same cache directory as track enrichments.
+    """
+    key = hashlib.sha1(f"similar|{artist.lower().strip()}".encode("utf-8")).hexdigest()[:16]
+
+    if use_cache:
+        cached = _read_cache(key)
+        if cached is not None:
+            return cached.get("names", [])
+
+    network = _get_network()
+    try:
+        similar = network.get_artist(artist).get_similar(limit=limit)
+        names = [s.item.name for s in similar]
+    except pylast.WSError:
+        names = []
+
+    if use_cache:
+        _write_cache(key, {"names": names})
+
+    return names
+
+
 def clear_cache() -> int:
     """Delete all cached Last.fm responses. Returns the number of files removed."""
     if not _cache_dir.exists():
