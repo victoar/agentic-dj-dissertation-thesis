@@ -156,6 +156,25 @@ def run_tests():
     if queue_ids:
         print(f"      First queued ID: {queue_ids[0]}")
 
+    # ── Test 11: get_top_tracks ──────────────────────────────
+    print("\n[11] get_top_tracks")
+    top = client.get_top_tracks(limit=10, time_range="short_term")
+    check("get_top_tracks returns a list", isinstance(top, list))
+    if top:
+        check("results are SpotifyTrack objects",
+              all(isinstance(t, SpotifyTrack) for t in top))
+        check("first result has non-empty name",  top[0].name != "")
+        check("first result has non-empty artist", top[0].artist != "unknown")
+        print(f"      {len(top)} top tracks fetched")
+        print(f"      Top: {top[0].name} — {top[0].artist}")
+    else:
+        print("      No top tracks returned (new account or API issue)")
+        check("get_top_tracks returns empty list gracefully (no exception)", True)
+
+    # medium_term sanity check
+    top_med = client.get_top_tracks(limit=5, time_range="medium_term")
+    check("medium_term also returns a list", isinstance(top_med, list))
+
     # ── Summary ──────────────────────────────────────────────
     print(f"\n{'='*55}")
     print(f"Results: {passed} passed  {failed} failed")

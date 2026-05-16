@@ -469,6 +469,26 @@ def reset_session(context: str = "general") -> dict:
 #  INTERNAL HELPERS
 # ════════════════════════════════════════════════════════════════════════════
 
+def _record_played_track(sp_track: SpotifyTrack) -> dict:
+    """
+    Record a track that was started via play() rather than queued.
+    Updates all session-tracking globals (_history, _queued_ids, _queued_names,
+    _state) without touching _queue or _lookahead — those are for buffered-ahead
+    tracks only.
+    """
+    global _state
+    candidate = _spotify_to_candidate(sp_track, enrich=True)
+    _history.append(candidate)
+    _queued_ids.add(sp_track.id)
+    _queued_names.add(sp_track.name.lower())
+    _state = advance_track(_state, Track(
+        id=sp_track.id,
+        name=sp_track.name,
+        artist=sp_track.artist,
+    ))
+    return candidate
+
+
 def _spotify_to_candidate(sp_track: SpotifyTrack, enrich: bool = True) -> dict:
     """
     Convert a SpotifyTrack into a rich candidate dict the agent can reason over.

@@ -1,6 +1,6 @@
 from agentic_dj.agent.state import (
     ListenerState, Track, FeedbackEvent, ArcPhase,
-    update_state, advance_track, init_state
+    update_state, advance_track, init_state, init_state_from_values,
 )
 
 def make_track(name, energy=0.7, valence=0.6, familiar=False):
@@ -137,6 +137,29 @@ def run_tests():
           got=s.energy)
     check("history logged correctly", len(s._history) == 6,
           got=len(s._history))
+
+    # ── Test 10: init_state_from_values ──────────────────────
+    print("\n[10] init_state_from_values")
+
+    # Values passed through exactly
+    s = init_state_from_values(energy=0.8, valence=0.3, focus=0.6, openness=0.4, social=0.9)
+    check("energy set correctly",   s.energy   == 0.8, got=s.energy)
+    check("valence set correctly",  s.valence  == 0.3, got=s.valence)
+    check("focus set correctly",    s.focus    == 0.6, got=s.focus)
+    check("openness set correctly", s.openness == 0.4, got=s.openness)
+    check("social set correctly",   s.social   == 0.9, got=s.social)
+    check("arc starts at WARMUP",   s.arc_phase == ArcPhase.WARMUP)
+
+    # Out-of-range values are clamped
+    s_clamped = init_state_from_values(energy=1.5, valence=-0.2, focus=0.5, openness=0.5, social=2.0)
+    check("energy clamped to 1.0",  s_clamped.energy  == 1.0, got=s_clamped.energy)
+    check("valence clamped to 0.0", s_clamped.valence == 0.0, got=s_clamped.valence)
+    check("social clamped to 1.0",  s_clamped.social  == 1.0, got=s_clamped.social)
+
+    # State is usable as normal afterwards
+    track = make_track("Test", energy=0.9)
+    s = update_state(s, FeedbackEvent.SKIP, track)
+    check("state is mutable after init_from_values", s.energy <= 0.8)
 
     # ── Summary ───────────────────────────────────────────────
     print(f"\n{'='*50}")

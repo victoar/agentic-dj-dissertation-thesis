@@ -17,7 +17,7 @@ import streamlit as st
 
 try:
     import agentic_dj.agent.tools as tool_module
-    from agentic_dj.agent.loop import run_agent_cycle
+    from agentic_dj.agent.loop import run_agent_cycle, start_session
     _agent_available = True
 except Exception:
     _agent_available = False
@@ -37,6 +37,9 @@ def init_session() -> None:
         st.session_state.session_history  = tool_module.get_session_history()
         st.session_state.last_trace       = []
         st.session_state.last_explanation = ""
+        st.session_state.session_label    = ""
+        st.session_state.start_status     = "idle"
+        st.session_state.start_error      = ""
         st.session_state.initialised      = True
         ensure_buffer(2)
     except Exception:
@@ -81,6 +84,31 @@ def detect_and_handle_track_change() -> bool:
     return False
 
 
+def start_session_from_description(description: str) -> dict:
+    """Interpret a natural language description, start playback, and fill the buffer."""
+    result = start_session(description, verbose=False)
+    if result.get("success"):
+        st.session_state.session_label = result.get("session_label", "")
+        st.session_state.start_status  = "idle"
+        st.session_state.start_error   = ""
+        refresh()
+        ensure_buffer(2)
+    else:
+        error = result.get("error", "unknown")
+        if error == "no_device":
+            st.session_state.start_error = (
+                "No active Spotify device found. "
+                "Open Spotify on any device and try again."
+            )
+        else:
+            st.session_state.start_error = (
+                "Couldn't find a track for that description. "
+                "Try something more specific."
+            )
+        st.session_state.start_status = "error"
+    return result
+
+
 def adapt_now_playing() -> dict:
     """Map tool outputs to the fields now_playing.render() expects."""
     playback    = st.session_state.current_playback
@@ -100,16 +128,17 @@ def adapt_now_playing() -> dict:
             break
 
     return {
-        "track_name":  name,
-        "artist":      artist,
-        "album":       playback.get("album", ""),
-        "energy_est":  energy_est,
-        "valence_est": valence_est,
-        "bpm":         bpm,
-        "key":         camelot,
-        "progress_ms": playback.get("progress_ms", 0),
-        "duration_ms": playback.get("duration_ms", 1),
-        "reasoning":   explanation or "Waiting for first agent cycle…",
+        "track_name":    name,
+        "artist":        artist,
+        "album":         playback.get("album", ""),
+        "energy_est":    energy_est,
+        "valence_est":   valence_est,
+        "bpm":           bpm,
+        "key":           camelot,
+        "progress_ms":   playback.get("progress_ms", 0),
+        "duration_ms":   playback.get("duration_ms", 1),
+        "reasoning":     explanation or "Waiting for first agent cycle…",
+        "session_label": st.session_state.get("session_label", ""),
     }
 
 

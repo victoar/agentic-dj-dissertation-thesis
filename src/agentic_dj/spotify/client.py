@@ -34,6 +34,7 @@ SCOPES = " ".join([
     "user-read-currently-playing",
     "user-library-read",
     "user-library-modify",
+    "user-top-read",
 ])
 
 
@@ -258,6 +259,15 @@ class SpotifyClient:
         except spotipy.SpotifyException:
             return False
 
+    def get_top_tracks(self, limit: int = 20, time_range: str = "short_term") -> list[SpotifyTrack]:
+        """Fetch the user's most-played tracks. time_range: short_term (4w), medium_term (6m), long_term (all time)."""
+        sp = self._get_sp()
+        try:
+            results = sp.current_user_top_tracks(limit=limit, time_range=time_range)
+            return [self._parse_track(t) for t in results.get("items", []) if t]
+        except spotipy.SpotifyException:
+            return []
+
     def get_saved_tracks(self, limit: int = 50) -> list[SpotifyTrack]:
         """
         Fetch the user's most recently saved tracks.
@@ -268,6 +278,12 @@ class SpotifyClient:
         items   = results.get("items", [])
         return [self._parse_track(item["track"])
                 for item in items if item.get("track")]
+    
+    def get_audio_analysis(self, track_id):
+        sp = self._get_sp()
+        result = sp.audio_analysis(track_id)
+        print(result)
+        return result
 
     # ── Internal helpers ─────────────────────────────────────────────────
 
