@@ -198,6 +198,23 @@ def advance_track(state: ListenerState, track: Track) -> ListenerState:
     return state
 
 
+def init_state_from_values(
+    energy: float,
+    valence: float,
+    focus: float,
+    openness: float,
+    social: float,
+) -> ListenerState:
+    """Initialise listener state from explicit float values (e.g. inferred from a vibe description)."""
+    return ListenerState(
+        energy=_clamp(energy),
+        valence=_clamp(valence),
+        focus=_clamp(focus),
+        openness=_clamp(openness),
+        social=_clamp(social),
+    )
+
+
 def init_state(context: str = "general") -> ListenerState:
     """
     Initialise listener state from a declared session context.

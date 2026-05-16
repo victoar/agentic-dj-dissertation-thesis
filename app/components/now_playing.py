@@ -77,6 +77,8 @@ def render(track: dict | None = None, on_feedback=None):
                 f"BPM {data.get('bpm') or '—'}",
                 f"Key {data.get('key', '—')}",
             ]
+            if data.get("session_label"):
+                badges.append(f"Session: {data['session_label']}")
             badge_html = "".join(
                 f'<span style="{badge_style}">{b}</span>' for b in badges
             )

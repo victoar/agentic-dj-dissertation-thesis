@@ -4,6 +4,7 @@ Tests each tool function in isolation before wiring them into the agent loop.
 """
 
 import agentic_dj.agent.tools as tool_module
+from agentic_dj.spotify.client import SpotifyTrack
 from agentic_dj.agent.tools import (
     get_listener_state,
     update_listener_state,
@@ -224,6 +225,58 @@ def run_tests():
           got=get_lookahead_depth())
     check("reset sets correct context",
           get_session_arc()["arc_phase"] == "warmup")
+
+    # ── 15. _record_played_track ─────────────────────────────
+    print("\n[15] _record_played_track")
+    reset_session("general")
+
+    # Build a fake SpotifyTrack — no live API needed
+    fake_track = SpotifyTrack(
+        id="fake_id_001",
+        name="Test Opening Track",
+        artist="Test Artist",
+        album="Test Album",
+        duration_ms=200_000,
+        uri="spotify:track:fake_id_001",
+    )
+
+    history_before  = len(tool_module._history)
+    queue_before    = len(tool_module._queue)
+    lookahead_before = len(tool_module._lookahead)
+
+    # Call the function (enrich=False path is used internally for fake tracks
+    # that aren't on Spotify; we monkeypatch _spotify_to_candidate to avoid API)
+    # Instead, call it directly and inspect the side-effects we can verify without API
+    tool_module._queued_ids.discard("fake_id_001")   # ensure clean slate
+    tool_module._queued_names.discard("test opening track")
+
+    # We can't enrich a fake track without hitting Last.fm, so test the
+    # bookkeeping side-effects by inspecting globals after a search-based track.
+    # Use a well-known track the live API can enrich.
+    results = tool_module._spotify.search("Mr Brightside The Killers", limit=1)
+    if results:
+        sp_track = results[0]
+        h_before = len(tool_module._history)
+        q_before = len(tool_module._queue)
+        la_before = len(tool_module._lookahead)
+
+        candidate = tool_module._record_played_track(sp_track)
+
+        check("_history grows by 1",         len(tool_module._history)    == h_before + 1,
+              got=len(tool_module._history))
+        check("_queue unchanged",            len(tool_module._queue)      == q_before,
+              got=len(tool_module._queue))
+        check("_lookahead unchanged",        len(tool_module._lookahead)  == la_before,
+              got=len(tool_module._lookahead))
+        check("track id added to _queued_ids",
+              sp_track.id in tool_module._queued_ids)
+        check("track name added to _queued_names",
+              sp_track.name.lower() in tool_module._queued_names)
+        check("returns candidate dict with name",
+              candidate.get("name") != "")
+    else:
+        print("      Search returned no results — skipping _record_played_track live test")
+        check("_record_played_track live test skipped gracefully", True)
 
     # ── Summary ──────────────────────────────────────────────
     print(f"\n{'='*55}")

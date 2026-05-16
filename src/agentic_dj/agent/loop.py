@@ -23,6 +23,7 @@ from google.genai import types
 from dotenv import load_dotenv
 
 from agentic_dj.agent import tools as tool_module
+from agentic_dj.agent.state import init_state_from_values
 from agentic_dj.music.camelot import parse as camelot_parse, compatibility_strength
 from agentic_dj.music import lastfm_client
 
@@ -602,4 +603,132 @@ INSTRUCTIONS:
         "trace":        trace,
         "steps":        6,
         "success":      queue_result.get("success", False),
+    }
+
+
+def start_session(description: str, verbose: bool = False) -> dict:
+    """
+    Start a new session from a natural language description.
+
+    Uses Gemini to interpret the vibe, searches for a strong opening track,
+    starts it playing on Spotify immediately, and seeds the listener state
+    vector from the inferred mood values.
+
+    Returns a dict with success, session_label, opening_track, fallback_used.
+    """
+    import random
+
+    if verbose:
+        print(f"\n[start_session] '{description}'")
+
+    # ── Step 1: Gemini interprets the description ─────────────
+    system = (
+        "You are an Agentic DJ. Interpret a listener's session description "
+        "and return structured JSON to guide music selection."
+    )
+    prompt = f"""Interpret this listening session description and return ONLY valid JSON (no markdown):
+
+{{
+  "energy":         <float 0.0-1.0, how energetic/intense>,
+  "valence":        <float 0.0-1.0, how happy/positive vs dark/sad>,
+  "focus":          <float 0.0-1.0, how focused vs party/social>,
+  "openness":       <float 0.0-1.0, how open to variety>,
+  "social":         <float 0.0-1.0, how social/group vs solo>,
+  "search_queries": ["<3 specific Spotify search strings that match the vibe>"],
+  "session_label":  "<short label summarising the vibe, e.g. '2016 clubbing vibes'>",
+  "confident":      <true if description has clear musical signal, false if vague or meaningless>
+}}
+
+Description: "{description}"
+"""
+
+    vibe = None
+    try:
+        raw = _call_gemini_with_retry(prompt, system)
+        # Strip markdown code fences if Gemini wraps its response
+        if "```" in raw:
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        vibe = json.loads(raw.strip())
+    except Exception as e:
+        if verbose:
+            print(f"[start_session] Gemini parse failed: {e}")
+
+    session_label  = (vibe or {}).get("session_label", description[:50]) or description[:50]
+    confident      = (vibe or {}).get("confident", False)
+    search_queries = (vibe or {}).get("search_queries", [])
+    target_energy  = float((vibe or {}).get("energy",  0.5))
+    target_valence = float((vibe or {}).get("valence", 0.5))
+
+    # ── Step 2: Reset session and apply inferred state ────────
+    tool_module.reset_session("general")
+    if vibe:
+        tool_module._state = init_state_from_values(
+            energy=target_energy,
+            valence=target_valence,
+            focus=float(vibe.get("focus",   0.5)),
+            openness=float(vibe.get("openness", 0.7)),
+            social=float(vibe.get("social",  0.3)),
+        )
+
+    # ── Step 3: Search for candidates ────────────────────────
+    candidates = []
+    if confident and search_queries:
+        seen_ids: set[str] = set()
+        for q in search_queries[:3]:
+            result = tool_module.search_tracks(q, limit=3)
+            for c in result.get("candidates", []):
+                if c["id"] not in seen_ids:
+                    seen_ids.add(c["id"])
+                    candidates.append(c)
+
+    # ── Step 4: Score by energy+valence proximity + recognizability ──
+    def _score(c: dict) -> float:
+        energy_match  = 1.0 - abs(c.get("energy_est",  0.5) - target_energy)
+        valence_match = 1.0 - abs(c.get("valence_est", 0.5) - target_valence)
+        popularity    = min(c.get("listeners", 0), 1_000_000) / 1_000_000
+        return energy_match + valence_match + 0.3 * popularity
+
+    best_candidate = max(candidates, key=_score) if candidates else None
+
+    # ── Step 5: Fallback to user's top tracks ────────────────
+    fallback_used = False
+    if not best_candidate or not confident:
+        fallback_used = True
+        top_tracks = tool_module._spotify.get_top_tracks(limit=20)
+        if not top_tracks:
+            return {"success": False, "error": "no_candidates", "session_label": session_label}
+        sp_track = random.choice(top_tracks)
+        if not confident:
+            session_label = "Your recent favourites"
+    else:
+        # Resolve a SpotifyTrack object for play() from the best candidate
+        results = tool_module._spotify.search(
+            f"{best_candidate['name']} {best_candidate['artist']}", limit=1
+        )
+        if not results:
+            return {"success": False, "error": "no_candidates", "session_label": session_label}
+        sp_track = results[0]
+
+    # ── Step 6: Start immediate playback ─────────────────────
+    if not tool_module._spotify.play(sp_track):
+        return {"success": False, "error": "no_device", "session_label": session_label}
+
+    # ── Step 7: Record opening track in session state ─────────
+    candidate = tool_module._record_played_track(sp_track)
+
+    if verbose:
+        print(f"[start_session] Playing: {sp_track.name} — {sp_track.artist}")
+        print(f"[start_session] Label: {session_label}  fallback={fallback_used}")
+
+    return {
+        "success":       True,
+        "session_label": session_label,
+        "opening_track": candidate,
+        "fallback_used": fallback_used,
+        "explanation":   (
+            f"Starting with '{sp_track.name}' by {sp_track.artist} "
+            f"for your '{session_label}' session."
+        ),
     }

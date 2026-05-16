@@ -5,6 +5,7 @@ from components.now_playing    import render as render_now_playing
 from components.listener_state import render as render_listener_state
 from components.queue          import render as render_queue
 from components.agent_trace    import render as render_agent_trace
+from components.start_session  import render as render_start_session
 
 st.set_page_config(
     page_title="Agentic DJ",
@@ -56,7 +57,16 @@ with tab_now:
                 on_feedback=bridge.handle_feedback,
             )
         else:
-            st.info("No track currently playing. Open Spotify on any device to get started.")
+            def _handle_submit(description: str) -> None:
+                with st.spinner("Finding the right track for you…"):
+                    bridge.start_session_from_description(description)
+                st.rerun()
+
+            render_start_session(
+                on_submit=_handle_submit,
+                status=st.session_state.get("start_status", "idle"),
+                error_message=st.session_state.get("start_error", ""),
+            )
 
     now_playing_fragment()
 
