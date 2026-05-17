@@ -278,12 +278,6 @@ class SpotifyClient:
         items   = results.get("items", [])
         return [self._parse_track(item["track"])
                 for item in items if item.get("track")]
-    
-    def get_audio_analysis(self, track_id):
-        sp = self._get_sp()
-        result = sp.audio_analysis(track_id)
-        print(result)
-        return result
 
     # ── Internal helpers ─────────────────────────────────────────────────
 
