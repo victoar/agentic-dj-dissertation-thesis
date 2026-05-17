@@ -452,6 +452,64 @@ def run_agent_cycle(
         content="Compatibility checked for all candidates",
         tool_result={"candidates_checked": len(enriched_candidates)}))
 
+    # ── Music theory filters — two-pass with widen-and-retry ────
+    # Pass 1 (strict): arc energy + BPM + Camelot must all pass.
+    # Pass 2 (widened): if pass 1 yields nothing, relax the arc energy range
+    #   by ±0.15 and drop the BPM/Camelot hard filters.
+    # Pass 3 (fallback): if pass 2 also yields nothing, use the full pool and
+    #   let Gemini/best_fallback pick from what's available.
+    _ARC_ENERGY_STRICT = {
+        "warmup":   (0.3, 0.5),
+        "build":    (0.5, 0.7),
+        "peak":     (0.8, 1.0),
+        "cooldown": (0.2, 0.4),
+    }
+    _ARC_ENERGY_WIDE = {
+        "warmup":   (0.15, 0.65),
+        "build":    (0.35, 0.85),
+        "peak":     (0.65, 1.0),
+        "cooldown": (0.05, 0.55),
+    }
+
+    arc_phase_str = arc.get("arc_phase", "build")
+    arc_low,  arc_high  = _ARC_ENERGY_STRICT.get(arc_phase_str, (0.0, 1.0))
+    warc_low, warc_high = _ARC_ENERGY_WIDE.get(arc_phase_str,   (0.0, 1.0))
+
+    all_enriched = enriched_candidates   # preserve full pool for fallback
+
+    # Pass 1 — strict
+    strict_pool = [
+        c for c in all_enriched
+        if arc_low <= c.get("energy_est", 0.5) <= arc_high
+        and c.get("bpm_ok", True)
+        and c.get("camelot_ok", True)
+    ]
+
+    if strict_pool:
+        enriched_candidates = strict_pool
+        if DISPLAY_LOGS:
+            print(f"\n[filters pass 1] strict — {len(strict_pool)} candidate(s) survived"
+                  f" (arc=[{arc_low},{arc_high}], BPM+Camelot hard)")
+    else:
+        # Pass 2 — widened arc only, BPM and Camelot hard filters dropped
+        if DISPLAY_LOGS:
+            print(f"\n[filters pass 1] strict eliminated all candidates — widening constraints")
+
+        widened_pool = [
+            c for c in all_enriched
+            if warc_low <= c.get("energy_est", 0.5) <= warc_high
+        ]
+
+        if widened_pool:
+            enriched_candidates = widened_pool
+            if DISPLAY_LOGS:
+                print(f"[filters pass 2] widened arc=[{warc_low},{warc_high}]"
+                      f" — {len(widened_pool)} candidate(s) survived")
+        else:
+            enriched_candidates = all_enriched   # pass 3: full pool
+            if DISPLAY_LOGS:
+                print("[filters pass 2] widened pass also empty — using full candidate pool")
+
     # ── Step 5: Single Gemini call to reason and select ──────
     if verbose:
         print("[think] Asking Gemini to select the best track...")

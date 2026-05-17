@@ -113,18 +113,19 @@ def run_tests():
     check("43 BPM jump rejected even at peak", r["acceptable"] is False,
         got=r["difference"])
 
-    r = estimate_bpm_compatibility(105, 120, "peak")
-    check("15 BPM jump acceptable at peak",  r["acceptable"] is True)
+    r = estimate_bpm_compatibility(105, 110, "peak")
+    check("5 BPM jump acceptable at peak (±8 threshold)",  r["acceptable"] is True)
 
     r = estimate_bpm_compatibility(120, 120, "build")
     check("same BPM → direction is 'same'",  r["direction"] == "same")
 
-    r = estimate_bpm_compatibility(120, 108, "cooldown")
-    check("12 BPM jump rejected in cooldown",r["acceptable"] is False,
+    # Cooldown is a transition phase → ±25 BPM threshold
+    r = estimate_bpm_compatibility(120, 93, "cooldown")
+    check("27 BPM jump rejected in cooldown (±25 threshold)", r["acceptable"] is False,
         got=r["difference"])
 
-    r = estimate_bpm_compatibility(120, 112, "cooldown")
-    check("8 BPM jump acceptable in cooldown", r["acceptable"] is True)
+    r = estimate_bpm_compatibility(120, 108, "cooldown")
+    check("12 BPM jump acceptable in cooldown (±25 threshold)", r["acceptable"] is True)
 
     # ── 8. search_tracks ────────────────────────────────────
     print("\n[8] search_tracks (live API)")
