@@ -13,11 +13,6 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-st.sidebar.markdown(
-    "BPM & key data: [GetSongKey](https://getsongkey.com)",
-    unsafe_allow_html=True,
-)
-
 st.markdown("""
 <style>
     [data-testid="collapsedControl"] { display: none; }
@@ -31,6 +26,8 @@ st.markdown("""
 bridge.init_session()
 
 st.markdown("## The practical application")
+
+print(st.session_state)
 
 if not st.session_state.get("initialised"):
     st.info(

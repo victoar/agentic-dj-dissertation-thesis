@@ -64,18 +64,10 @@ def _auth_headers() -> dict:
 
 
 def _get(url: str) -> dict:
-    """HTTP GET → parsed JSON. Raises on any network or HTTP error."""
+    """HTTP GET → parsed JSON. Raises urllib.error.HTTPError on HTTP errors."""
     req = urllib.request.Request(url, headers=_auth_headers())
-    try:
-        with urllib.request.urlopen(req, timeout=8) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        body = ""
-        try:
-            body = e.read().decode("utf-8", errors="replace")
-        except Exception:
-            pass
-        raise RuntimeError(f"HTTP {e.code} {e.reason} — {url}\n  body: {body}") from e
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
@@ -123,6 +115,14 @@ def fetch_by_platform(
         else:
             result["error"] = f"response had no 'uuid' — keys: {list(song.keys())}"
             print(f"  [soundcharts/miss] by-platform/{platform}/{identifier}: {result['error']}")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            result["error"] = "not found on Soundcharts"
+            print(f"  [soundcharts/miss] by-platform/{platform}/{identifier}: not on Soundcharts (404)")
+        else:
+            result["error"] = f"HTTP {e.code} {e.reason}"
+            print(f"  [soundcharts/error] by-platform/{platform}/{identifier}: HTTP {e.code} {e.reason}")
+            traceback.print_exc()
     except Exception as exc:
         result["error"] = str(exc)
         print(f"  [soundcharts/error] by-platform/{platform}/{identifier}: {exc}")
@@ -172,6 +172,14 @@ def fetch_song(uuid: str, use_cache: bool = True) -> dict:
         else:
             result["error"] = f"response 'object' was empty — top-level keys: {list(data.keys())}"
             print(f"  [soundcharts/miss] song/{uuid}: {result['error']}")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            result["error"] = "not found on Soundcharts"
+            print(f"  [soundcharts/miss] song/{uuid}: not on Soundcharts (404)")
+        else:
+            result["error"] = f"HTTP {e.code} {e.reason}"
+            print(f"  [soundcharts/error] song/{uuid}: HTTP {e.code} {e.reason}")
+            traceback.print_exc()
     except Exception as exc:
         result["error"] = str(exc)
         print(f"  [soundcharts/error] song/{uuid}: {exc}")
@@ -206,8 +214,9 @@ def fetch_track_info(spotify_id: str, use_cache: bool = True) -> dict:
     """
     Return BPM and Camelot position for a Spotify track via Soundcharts.
 
-    Uses the by-platform endpoint which returns audio features in a single
-    request — no second API call needed.
+    Tries the Spotify track ID first. If Soundcharts returns 404 (the ID it
+    has indexed may differ across regions/versions), falls back to ISRC lookup
+    which is a universal identifier and more reliable.
 
     Returns:
         {"bpm": float | None, "camelot_position": str | None, "found": bool}
