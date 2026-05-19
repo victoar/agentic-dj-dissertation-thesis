@@ -216,7 +216,14 @@ claim in actual tool output — never invent values. Do not queue a track
 already played this session. Stop as soon as one track is queued. In
 your final explanation reference at least one concrete signal (feedback
 event, arc phase, state dimension) and one musical property (key, BPM,
-energy)."""
+energy).
+
+Hard rejection rule: if check_transition returns a score below 0.4
+(verdict "avoid") AND estimate_bpm_compatibility returns acceptable=False
+for the same candidate, you MUST discard that candidate and search for
+a different one. Do not call add_track_to_queue on a track that has
+failed both checks. A candidate that passes at least one of the two
+checks (harmonic OR BPM) may be accepted."""
 
 
 SESSION_INTERPRET_SYSTEM = "Return only valid JSON. No prose, no markdown fences."
@@ -401,6 +408,8 @@ def _run_react_loop(
             try:
                 args = json.loads(tool_call.function.arguments)
             except json.JSONDecodeError:
+                args = {}
+            if not isinstance(args, dict):
                 args = {}
 
             if DISPLAY_LOGS:
