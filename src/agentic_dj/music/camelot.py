@@ -89,8 +89,6 @@ def from_spotify(spotify_key: int, spotify_mode: int) -> CamelotKey | None:
 
 def parse(camelot_string: str) -> CamelotKey | None:
     """Parse a Camelot string like '8B' or '12A' into a CamelotKey."""
-    if camelot_string is None:
-        return None
     s = camelot_string.strip().upper()
     if len(s) < 2 or s[-1] not in ("A", "B"):
         return None

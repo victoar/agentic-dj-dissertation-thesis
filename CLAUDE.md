@@ -40,12 +40,14 @@ The system has three conceptual layers:
 12 functions grouped into four sets: state read/write, music theory (Camelot + BPM), Spotify+Last.fm search/enrichment, and queue management. All session state (listener state vector, queue, history, played-track sets) lives as module-level globals. `reset_session()` clears everything. The duplicate guard uses both `_queued_ids` (Spotify track ID set) and `_queued_names` (lowercase name set) to prevent any repeat across a session.
 
 **3. Agent loop** (`agent/loop.py`)
-True ReAct loop — Groq (`llama-3.3-70b-versatile`) orchestrates all tool calls autonomously via native function-calling. Steps:
-1. Apply feedback (if any) → update state in Python immediately
-2. Build system + user messages, pass `GROQ_TOOLS` to Groq
-3. Loop (max 15 iterations): Groq calls tools → Python executes → result appended → repeat
-4. Loop ends when Groq calls `add_track_to_queue` successfully, then one final call with `tool_choice="none"` retrieves the listener explanation
-5. Fallback to `_best_fallback()` (energy+valence distance scorer) if loop exhausts without queuing
+Single-shot ReAct cycle — all context is collected in Python (no LLM tool calls for observation), then one Gemini call selects the track. Steps:
+1. Apply feedback (if any) → update state
+2. Collect state, arc, playback, history, queue
+3. Two Spotify+Last.fm searches → deduplicated candidate list
+4. BPM compatibility scored per candidate (falls back to `bpm_ok=True` when BPM unknown)
+5. Single Gemini call with a structured JSON prompt → parse selection
+6. Fallback to `_best_fallback()` (energy+valence distance scorer) if Gemini parse fails
+7. Duplicate retry: if the selected track was already played, sort remaining candidates by state distance and try each in order
 
 **Music intelligence** (`music/`)
 - `camelot.py`: `CamelotKey`, `compatible_positions()` (returns 4 positions), `compatibility_strength()` (0.0–1.0 score). Wheel wrap-around at 12→1 handled via `_wheel_distance()`.
@@ -57,7 +59,7 @@ SpotifyPKCE auth via Spotipy. `is_saved()` checks the user's library (familiarit
 
 ## Critical constraints
 
-- **LLM**: Use `groq` SDK (`from groq import Groq`). Model: `llama-3.3-70b-versatile`. API key: `GROQ_API_KEY`. Rate limit is ~30 req/min; the loop uses exponential backoff (2s, 4s, 8s, 16s on 429). Do not use `google-genai` — removed.
+- **LLM**: Use `google-genai` SDK (`from google import genai`). The model ID is `gemini-3-flash-preview`. **Do not** use `google-generativeai` (deprecated). Rate limit is 5 req/min; the loop uses exponential backoff (12s, 24s, 48s, 96s on 429).
 - **Spotify**: `audio-features` and `recommendations` endpoints return 403/404 — never call them. The popularity field is always 0 in Development Mode — use Last.fm listener counts instead. Playback control requires Spotify Premium.
 - **BPM**: Spotify audio-features (which included tempo) is gone. Track BPM is currently not populated; BPM checks fall back to `bpm_ok=True`.
 - **State is module-level**: `tools.py` holds all session state as module globals. Not thread-safe; single session at a time.

@@ -20,11 +20,11 @@ def test_basic_cycle():
     assert isinstance(result, dict)
     assert "explanation"  in result
     assert "trace"        in result
-    assert "success"      in result
-    assert len(result["trace"]) > 0, "Agent made zero tool calls"
+    assert "steps"        in result
+    assert result["steps"] > 0, "Agent made zero tool calls"
     assert len(result["explanation"]) > 20, "Explanation is too short"
 
-    print(f"\n✓ Cycle completed in {len(result['trace'])} steps")
+    print(f"\n✓ Cycle completed in {result['steps']} steps")
     print(f"✓ Success: {result['success']}")
     print(f"✓ Explanation: {result['explanation'][:200]}")
 
@@ -43,6 +43,7 @@ def test_cycle_with_feedback():
         verbose=True,
     )
 
+    assert result["steps"] > 0
     assert len(result["trace"]) > 0
 
     # Check that update_listener_state was called with the skip
