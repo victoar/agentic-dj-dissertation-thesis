@@ -27,6 +27,7 @@ bridge.init_session()
 
 st.markdown("## The practical application")
 
+# TODO: remove print after sorting things out
 print(st.session_state)
 
 if not st.session_state.get("initialised"):
