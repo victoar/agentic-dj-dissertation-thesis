@@ -50,6 +50,7 @@ class SpotifyTrack:
     album:       str
     duration_ms: int
     uri:         str           # spotify:track:xxx — needed for playback
+    isrc:        str = ""      # ISO recording code — universal track identifier
 
 
 @dataclass
@@ -292,4 +293,5 @@ class SpotifyClient:
             album=raw.get("album", {}).get("name", ""),
             duration_ms=raw.get("duration_ms", 0),
             uri=raw.get("uri", ""),
+            isrc=raw.get("external_ids", {}).get("isrc", ""),
         )

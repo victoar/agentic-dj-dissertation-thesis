@@ -10,21 +10,22 @@ type: project
 
 **Why:** This is an original research contribution — the direction-aware state update rules (e.g., skipping a high-energy track lowers energy; skipping a low-energy track raises it) are the thesis's novel claim.
 
-**Architecture:** Single-shot ReAct pattern. Full multi-step ReAct was prototyped but abandoned due to Gemini free-tier rate limits (5 req/min → max 2 API calls per cycle).
+**Architecture:** True multi-step ReAct loop on Groq (`llama-3.3-70b-versatile`, ~30 req/min). The model decides which of the 12 tools to call and in what order — the system prompt names the tools but does not script the order. Both entry points are ReAct: `run_agent_cycle` for per-track selection (stops on `add_track_to_queue`) and `start_session` for bootstrap (one structured-JSON extraction pass, then a focused 3-tool sub-loop stopping on `select_opening_track`). Each loop iteration logs a `think` entry (the model's reasoning text) and an `act` entry per tool call — the trace is the substrate for the dissertation's failure taxonomy. An earlier single-shot variant (one Gemini call over a pre-filtered candidate list) was a workaround for Gemini free-tier's 5 req/min ceiling; it has been replaced.
 
 **Tech stack:**
 - Python 3.11, src layout (`src/agentic_dj/`), Hatchling build, pytest
-- LLM: Google Gemini Flash via `google-genai` SDK (NOT deprecated `google-generativeai`)
+- LLM: Groq `llama-3.3-70b-versatile` via the `groq` SDK. Exponential backoff on 429 (2s, 4s, 8s, 16s). `GROQ_API_KEY` in `.env`
 - Spotify: Spotipy with SpotifyPKCE auth. Audio features + recommendations endpoints are deprecated (post Nov 2024) — NOT used
-- Last.fm: pylast, disk-cached (`.cache/lastfm/` SHA1-keyed JSON), replaces Spotify audio features
+- Last.fm: pylast, disk-cached (`.cache_lastfm/` SHA1-keyed JSON), replaces Spotify audio features
+- BPM + Camelot key: Soundcharts API, disk-cached (`.cache_soundcharts/`); replaced both Deezer and GetSongAPI
 - Music theory: music21 + custom Camelot Wheel (`music/camelot.py`)
 - Tag features: 110+ tag lexicon, semantic fallback via sentence-transformers `all-MiniLM-L6-v2`
-- UI (not yet built): Streamlit + Plotly
+- UI: Streamlit + Plotly (`app/app.py`, `app/bridge.py`, `app/components/`)
 
 **Key modules:**
 - `agent/state.py` — ListenerState, FeedbackEvent, update_state, advance_track, init_state
 - `agent/tools.py` — 12 tool functions in 4 groups; session uniqueness guard (_queued_ids, _queued_names); reset_session()
-- `agent/loop.py` — Single-shot ReAct cycle, Gemini integration, exponential backoff (12/24/48/96s on 429), fallback scoring, duplicate retry
+- `agent/loop.py` — True multi-step ReAct loops for both `run_agent_cycle` and `start_session`. Generic `_run_react_loop` driver (max 15 iterations, parametrised by tool registry and stop tool); Groq exponential backoff (2/4/8/16s on 429); state-derived fallback search when the loop fails to commit; `_best_fallback` scorer as final safety net
 - `music/camelot.py` — Camelot Wheel, CamelotKey, compatibility_strength(), compatible_positions()
 - `music/tags.py` — TAG_LEXICON, estimate_features, estimate_features_with_fallback
 - `music/lastfm_client.py` — enrich_track(), disk cache, graceful unknown-track handling

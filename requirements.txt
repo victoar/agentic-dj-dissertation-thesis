@@ -3,7 +3,7 @@ plotly
 spotipy
 pylast
 python-dotenv
-google-genai
+groq
 langchain
 langgraph
 music21
