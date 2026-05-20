@@ -41,9 +41,10 @@ def init_session() -> None:
         st.session_state.start_status     = "idle"
         st.session_state.start_error      = ""
         st.session_state.initialised      = True
-        ensure_buffer(2)
-    except Exception:
+    except Exception as e:
         st.session_state.initialised = False
+        st.session_state.init_error = str(e)
+        return
 
 
 def refresh() -> None:

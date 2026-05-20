@@ -29,7 +29,7 @@ from agentic_dj.music.camelot import (
 )
 from agentic_dj.music.tags import estimate_features_with_fallback
 from agentic_dj.music.lastfm_client import enrich_track, fetch_enrichment
-from agentic_dj.music.getsongkey_client import fetch_track_info
+from agentic_dj.music.soundcharts_client import fetch_track_info
 from agentic_dj.spotify.client import SpotifyClient, SpotifyTrack
 
 
@@ -191,20 +191,19 @@ def estimate_bpm_compatibility(
 ) -> dict:
     """
     Check whether a BPM transition is smooth given the current arc phase.
-    Thresholds per phase:
-      warmup   → max 10 BPM difference
-      build    → max 15 BPM difference
-      peak     → max 20 BPM difference
-      cooldown → max 10 BPM difference
+
+    Steady-state phases (warmup, peak) use a tight ±8 BPM window.
+    Transition phases (build, cooldown) allow ±25 BPM because energy is
+    intentionally shifting and larger tempo steps are acceptable.
     """
     thresholds = {
-        "warmup":   10.0,
-        "build":    15.0,
-        "peak":     20.0,
-        "cooldown": 10.0,
+        "warmup":   8.0,   # steady — establishing the session
+        "build":    25.0,  # transition — energy intentionally rising
+        "peak":     8.0,   # steady — holding at maximum energy
+        "cooldown": 25.0,  # transition — energy intentionally winding down
     }
 
-    threshold  = thresholds.get(arc_phase, 15.0)
+    threshold  = thresholds.get(arc_phase, 8.0)
     diff       = abs(current_bpm - candidate_bpm)
     acceptable = diff <= threshold
     direction  = (
@@ -525,7 +524,7 @@ def _spotify_to_candidate(sp_track: SpotifyTrack, enrich: bool = True) -> dict:
                 "listeners":   enr.listeners,
             })
 
-        info = fetch_track_info(sp_track.artist, sp_track.name)
+        info = fetch_track_info(sp_track.id)
         candidate["bpm"]              = info["bpm"]
         candidate["camelot_position"] = info["camelot_position"]
 
@@ -533,7 +532,7 @@ def _spotify_to_candidate(sp_track: SpotifyTrack, enrich: bool = True) -> dict:
             status  = "found" if info["found"] else "miss "
             bpm_str = f"BPM={candidate['bpm']}" if candidate.get("bpm") else "BPM=—"
             key_str = f"Key={candidate['camelot_position']}" if candidate.get("camelot_position") else "Key=—"
-            print(f"  [getsongkey/{status}] {sp_track.artist} — {sp_track.name}  →  {bpm_str}  {key_str}")
+            print(f"  [soundcharts/{status}] {sp_track.artist} — {sp_track.name}  →  {bpm_str}  {key_str}")
 
     candidate["key"] = candidate.get("camelot_position")
 

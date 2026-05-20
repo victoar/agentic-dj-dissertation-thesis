@@ -37,6 +37,7 @@ def run_tests():
     check("first result has a URI",
           results[0].uri.startswith("spotify:track:"),
           got=results[0].uri)
+    print(results[0])
     print(f"      Top result: {results[0].name} — {results[0].artist} ")
 
     # ── Test 2: Search by mood tags ──────────────────────────

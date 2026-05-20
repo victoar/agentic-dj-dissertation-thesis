@@ -1,16 +1,28 @@
 """
 ReAct agent loop — the reasoning core of the Agentic DJ system.
 
-The loop follows the ReAct pattern (Reasoning + Acting):
-  1. Observe  — read current state, playback, session history
-  2. Think    — LLM reasons about what to do next
-  3. Act      — call a tool
-  4. Observe  — read the tool result
-  5. Repeat   — until the LLM decides it has enough to make a decision
-  6. Respond  — generate a plain-language explanation for the listener
+Both entry points (run_agent_cycle, start_session) are implemented as true
+Reason → Act → Observe loops on Groq's native function-calling. The model
+is given a goal and a toolbox; it decides which tools to call, in what
+order, and when it has gathered enough to commit. No procedural rules.
 
-The LLM has access to all 12 tools defined in agent/tools.py.
-It selects and sequences them autonomously based on the situation.
+Every iteration logs:
+  • a `think` trace entry  (the model's natural-language reasoning, if any)
+  • one `act`   trace entry per tool call  (tool name, arguments, result)
+
+This makes the trace a faithful record of the agent's behaviour — the
+substrate the dissertation's failure taxonomy (state lag, novelty
+miscalibration, arc rigidity, key tunnel vision) is built on.
+
+Architecture:
+  - Single generic _run_react_loop driver, parametrised by tool registry
+    and the name of the terminal "stop tool".
+  - run_agent_cycle uses the 12-tool catalogue and stops on add_track_to_queue.
+  - start_session uses a focused inner toolset (search + select-opening)
+    and stops on a synthetic select_opening_track tool defined inline.
+  - A structured-JSON pre-step in start_session extracts the vibe vector
+    from the description. Extraction is one-shot by design — reasoning
+    happens in the sub-loop that picks the actual track.
 """
 
 import json
@@ -18,55 +30,32 @@ import os
 import time
 from typing import Any
 
-from google import genai
-from google.genai import types
+from groq import Groq
 from dotenv import load_dotenv
 
 from agentic_dj.agent import tools as tool_module
 from agentic_dj.agent.state import init_state_from_values
-from agentic_dj.music.camelot import parse as camelot_parse, compatibility_strength
-from agentic_dj.music import lastfm_client
+
+# ── Configuration ─────────────────────────────────────────────────────────────
 
 load_dotenv()
-client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+MODEL  = "llama-3.3-70b-versatile"
 
-DISPLAY_LOGS: bool = True   # flip to True to see the full recommendation trace
-
-
-# ── System prompt ─────────────────────────────────────────────────────────────
-SYSTEM_PROMPT = """You are the reasoning core of an Agentic DJ system.
-Your job is to select the best next track for the listener and explain
-your choice in one or two plain sentences.
-
-You have access to tools that let you:
-- Read the listener's current state (energy, valence, focus, openness)
-- Check the session arc phase (warmup, build, peak, cooldown)
-- Search for candidate tracks using Spotify + Last.fm enrichment
-- Check harmonic compatibility between tracks (Camelot Wheel)
-- Check BPM compatibility between tracks
-- Add the chosen track to the playback queue
-
-RULES you must always follow:
-1. Always call get_listener_state first to orient your reasoning.
-2. Always call get_session_arc to understand where in the session we are.
-3. Always call get_current_playback to know what is currently playing.
-4. Search for candidates using search_tracks before selecting.
-5. Check harmonic compatibility using check_transition before queuing.
-6. Check BPM compatibility using estimate_bpm_compatibility before queuing.
-7. Only call add_track_to_queue once — for the single best candidate.
-8. After queuing, generate a one or two sentence explanation for the listener.
-   Reference at least one concrete signal (a skip, replay, the arc phase)
-   and at least one musical property (key compatibility, BPM, energy level).
-9. Never select a track already in recent session history.
-10. If no compatible track is found, explain why and suggest the closest option.
-"""
+DISPLAY_LOGS: bool = True       # set False to silence the trace stream
+MAX_ITERATIONS:       int = 15  # safety cap on a single ReAct loop
+MAX_BACKOFF_ATTEMPTS: int = 4   # exponential backoff retries on 429
 
 
-# ── Tool definitions for Gemini ───────────────────────────────────────────────
-# Gemini uses a function declaration schema to understand what tools exist
-# and what parameters they take.
+# ══════════════════════════════════════════════════════════════════════════════
+#  TOOL CATALOGUE  —  the 12 tools the cycle loop reasons over
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Plain JSON schemas, OpenAI / Groq compatible. Each declaration is the
+# single source of truth: GROQ_TOOLS wraps it in the API envelope, and
+# TOOL_REGISTRY maps the name back to the Python function.
 
-TOOL_DECLARATIONS = [
+TOOL_DECLARATIONS: list[dict] = [
     {
         "name": "get_listener_state",
         "description": "Return the current listener state vector — energy, valence, focus, openness, social, arc_phase.",
@@ -87,7 +76,7 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "get_session_arc",
-        "description": "Return the current arc phase and description of what it means for track selection.",
+        "description": "Return the current arc phase and a description of what it means for track selection.",
         "parameters": {"type": "object", "properties": {}, "required": []},
     },
     {
@@ -103,7 +92,7 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "check_transition",
-        "description": "Check harmonic smoothness between two Camelot positions. Score 0.0-1.0.",
+        "description": "Check harmonic smoothness between two Camelot positions. Returns a score 0.0–1.0 and a verdict.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -115,7 +104,7 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "estimate_bpm_compatibility",
-        "description": "Check if a BPM jump between two tracks is smooth for the current arc phase.",
+        "description": "Check whether a BPM jump between two tracks is smooth for the current arc phase.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -140,7 +129,7 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "get_track_details",
-        "description": "Get full details for a specific track — metadata, tags, energy, valence.",
+        "description": "Get full details for a specific track — metadata, tags, energy, valence, BPM, Camelot key.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -167,7 +156,7 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "add_track_to_queue",
-        "description": "Add a track to the Spotify playback queue. Call this once with the single best candidate.",
+        "description": "Add a track to the Spotify playback queue. This is the terminal action — call it once with the single best candidate.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -179,28 +168,105 @@ TOOL_DECLARATIONS = [
     },
 ]
 
-# Map tool name strings to actual Python functions
+# Groq/OpenAI function-call envelope
+GROQ_TOOLS: list[dict] = [
+    {"type": "function", "function": decl} for decl in TOOL_DECLARATIONS
+]
+
+# Name → Python function lookup for tool execution
 TOOL_REGISTRY: dict[str, Any] = {
-    "get_listener_state":        tool_module.get_listener_state,
-    "update_listener_state":     tool_module.update_listener_state,
-    "get_session_arc":           tool_module.get_session_arc,
-    "get_compatible_keys":       tool_module.get_compatible_keys,
-    "check_transition":          tool_module.check_transition,
-    "estimate_bpm_compatibility":tool_module.estimate_bpm_compatibility,
-    "search_tracks":             tool_module.search_tracks,
-    "get_track_details":         tool_module.get_track_details,
-    "get_current_playback":      tool_module.get_current_playback,
-    "get_queue_state":           tool_module.get_queue_state,
-    "get_session_history":       tool_module.get_session_history,
-    "add_track_to_queue":        tool_module.add_track_to_queue,
+    "get_listener_state":         tool_module.get_listener_state,
+    "update_listener_state":      tool_module.update_listener_state,
+    "get_session_arc":            tool_module.get_session_arc,
+    "get_compatible_keys":        tool_module.get_compatible_keys,
+    "check_transition":           tool_module.check_transition,
+    "estimate_bpm_compatibility": tool_module.estimate_bpm_compatibility,
+    "search_tracks":              tool_module.search_tracks,
+    "get_track_details":          tool_module.get_track_details,
+    "get_current_playback":       tool_module.get_current_playback,
+    "get_queue_state":            tool_module.get_queue_state,
+    "get_session_history":        tool_module.get_session_history,
+    "add_track_to_queue":         tool_module.add_track_to_queue,
 }
 
 
-# ── Trace entry ───────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  SYSTEM PROMPTS
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Tool-aware, not procedural. The prompt names the goal and the toolbox.
+# It does not script the tool order — the model decides what to call and
+# when based on the reasoning it produces.
 
-def _make_trace_entry(
+CYCLE_SYSTEM_PROMPT = """\
+You are the reasoning core of an Agentic DJ.
+
+Goal: pick the single best next track for this listener and queue it,
+then explain your choice in one or two plain sentences.
+
+Toolbox:
+  • Listener state   — get_listener_state, update_listener_state, get_session_arc
+  • Playback context — get_current_playback, get_session_history, get_queue_state
+  • Search           — search_tracks, get_track_details
+  • Music theory     — get_compatible_keys, check_transition, estimate_bpm_compatibility
+  • Action           — add_track_to_queue   (terminal — call once)
+
+Reason about what you need, call tools to find out, decide. Ground every
+claim in actual tool output — never invent values. Do not queue a track
+already played this session. Stop as soon as one track is queued. In
+your final explanation reference at least one concrete signal (feedback
+event, arc phase, state dimension) and one musical property (key, BPM,
+energy).
+
+Hard rejection rule: if check_transition returns a score below 0.4
+(verdict "avoid") AND estimate_bpm_compatibility returns acceptable=False
+for the same candidate, you MUST discard that candidate and search for
+a different one. Do not call add_track_to_queue on a track that has
+failed both checks. A candidate that passes at least one of the two
+checks (harmonic OR BPM) may be accepted."""
+
+
+SESSION_INTERPRET_SYSTEM = "Return only valid JSON. No prose, no markdown fences."
+
+SESSION_INTERPRET_USER = """\
+Interpret this listening session description and return ONLY a JSON object \
+with these fields:
+
+{{
+  "energy":         <float 0.0-1.0, how energetic/intense>,
+  "valence":        <float 0.0-1.0, how positive/happy vs dark/sad>,
+  "focus":          <float 0.0-1.0, how focused vs party/social>,
+  "openness":       <float 0.0-1.0, how open to variety>,
+  "social":         <float 0.0-1.0, how social/group vs solo>,
+  "search_queries": ["<3 specific Spotify search strings that match the vibe>"],
+  "session_label":  "<short evocative label, e.g. '2016 clubbing vibes'>",
+  "confident":      <true if the description has clear musical signal, false if vague>
+}}
+
+Description: "{description}"
+"""
+
+SESSION_PICK_SYSTEM = """\
+You are an Agentic DJ choosing the OPENING track for a new listening session.
+
+Toolbox (focused subset):
+  • search_tracks(query, limit)         — find candidates
+  • get_track_details(track_name, artist) — inspect one in detail
+  • select_opening_track(track_name, artist)  — terminal action, call once
+
+Reason about which track best opens the described session. Search using
+the suggested queries (or your own variants), examine candidates, then
+commit one choice. Never invent track titles — only commit a track you
+have seen in a search result."""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TRACE
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _trace_entry(
     step:        int,
-    kind:        str,   # "think" | "act" | "observe" | "explain"
+    kind:        str,                 # "think" | "act" | "observe" | "explain"
     content:     str,
     tool_name:   str | None = None,
     tool_args:   dict | None = None,
@@ -216,45 +282,200 @@ def _make_trace_entry(
     }
 
 
-# ── Main agent loop ───────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+#  GROQ CALL WITH EXPONENTIAL BACKOFF
+# ══════════════════════════════════════════════════════════════════════════════
 
-def _call_gemini_with_retry(
-    prompt:      str,
-    system:      str,
-    max_retries: int = 4,
-) -> str:
+def _groq_call(
+    messages:    list[dict],
+    tools:       list[dict] | None = None,
+    tool_choice: str = "auto",
+) -> Any:
     """
-    Call Gemini with exponential backoff on rate limit errors.
-    Returns the raw text response.
+    Wrap client.chat.completions.create with retry on 429 / rate-limit errors.
+    Waits 2s, 4s, 8s, 16s between attempts.
+    Other exceptions propagate immediately.
     """
-    for attempt in range(max_retries):
+    kwargs: dict[str, Any] = {
+        "model":       MODEL,
+        "messages":    messages,
+        "temperature": 0.3,
+    }
+    if tools is not None:
+        kwargs["tools"]       = tools
+        kwargs["tool_choice"] = tool_choice
+
+    last_exc: Exception | None = None
+    for attempt in range(MAX_BACKOFF_ATTEMPTS):
         try:
-            response = client.models.generate_content(
-                model='gemini-3-flash-preview',
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system,
-                    temperature=0.3,
-                )
-            )
-            return response.text.strip()
+            return client.chat.completions.create(**kwargs)
         except Exception as e:
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                wait = (2 ** attempt) * 12
-                print(f"\n[rate limit] Waiting {wait}s before retry {attempt + 1}/{max_retries}...")
+            last_exc = e
+            err = str(e).lower()
+            if "429" in str(e) or "rate_limit" in err or "too many" in err:
+                wait = (2 ** attempt) * 2   # 2s, 4s, 8s, 16s
+                if DISPLAY_LOGS:
+                    print(f"[rate limit] waiting {wait}s (retry {attempt + 1}/{MAX_BACKOFF_ATTEMPTS})")
                 time.sleep(wait)
             else:
                 raise
-    raise RuntimeError("Gemini rate limit exceeded after all retries.")
+    raise RuntimeError(
+        f"Groq rate limit exceeded after {MAX_BACKOFF_ATTEMPTS} retries"
+    ) from last_exc
 
-def _best_fallback(
-    candidates: list[dict],
-    state:      dict,
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  REACT LOOP DRIVER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _run_react_loop(
+    messages:       list[dict],
+    trace:          list[dict],
+    max_iterations: int = MAX_ITERATIONS,
+    registry:       dict[str, Any] | None = None,
+    tools_schema:   list[dict] | None = None,
+    stop_tool:      str = "add_track_to_queue",
+    log_prefix:     str = "react",
 ) -> dict:
     """
-    When Gemini JSON parsing fails, pick the most compatible candidate
-    based on energy and valence distance from the current state rather
-    than just taking the first result.
+    Drive a Reason→Act→Observe loop until `stop_tool` fires successfully
+    or `max_iterations` is reached.
+
+    On each iteration:
+      1. Call Groq with messages + tools.
+      2. If the assistant produced reasoning text, append a 'think' trace entry.
+      3. Append the assistant turn to messages (so its tool-call envelopes
+         are visible to the next iteration).
+      4. If no tool calls, the assistant has given its final answer — record
+         an 'explain' entry and return.
+      5. Otherwise execute each tool call, log an 'act' entry per call,
+         and append the result as a 'tool' message.
+      6. If `stop_tool` succeeded, ask Groq once more (tools disabled) for
+         its plain-language explanation and return.
+
+    Returns: {"queued": <stop_tool_result_or_None>, "explanation": <str>}
+    """
+    if registry is None:
+        registry = TOOL_REGISTRY
+    if tools_schema is None:
+        tools_schema = GROQ_TOOLS
+
+    terminal:    dict | None = None
+    explanation: str         = ""
+    step:        int         = 1
+
+    for iteration in range(max_iterations):
+        # ── 1. Ask the model ──────────────────────────────────
+        response = _groq_call(messages, tools=tools_schema, tool_choice="auto")
+        msg      = response.choices[0].message
+        reasoning = (msg.content or "").strip()
+
+        # ── 2. Log reasoning text as a 'think' entry ──────────
+        if reasoning:
+            trace.append(_trace_entry(step, "think", reasoning))
+            if DISPLAY_LOGS:
+                print(f"\n[{log_prefix}/think] {reasoning[:240]}")
+            step += 1
+
+        # ── 3. Append assistant turn to the message history ───
+        assistant_msg: dict = {"role": "assistant", "content": msg.content or ""}
+        if msg.tool_calls:
+            assistant_msg["tool_calls"] = [
+                {
+                    "id":   tc.id,
+                    "type": "function",
+                    "function": {
+                        "name":      tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in msg.tool_calls
+            ]
+        messages.append(assistant_msg)
+
+        # ── 4. No tool calls → final text response ────────────
+        if not msg.tool_calls:
+            explanation = reasoning
+            if explanation:
+                trace.append(_trace_entry(step, "explain", explanation))
+                step += 1
+            break
+
+        # ── 5. Execute each tool call ─────────────────────────
+        stop_fired = False
+        for tool_call in msg.tool_calls:
+            name = tool_call.function.name
+            try:
+                args = json.loads(tool_call.function.arguments)
+            except json.JSONDecodeError:
+                args = {}
+            if not isinstance(args, dict):
+                args = {}
+
+            if DISPLAY_LOGS:
+                print(f"[{log_prefix}/act ] → {name}({json.dumps(args)[:140]})")
+
+            if name in registry:
+                try:
+                    result = registry[name](**args)
+                except Exception as exc:
+                    result = {"error": f"Tool '{name}' raised: {exc}"}
+            else:
+                result = {"error": f"Unknown tool: {name}"}
+
+            if DISPLAY_LOGS:
+                print(f"[{log_prefix}/obs ] ← {str(result)[:200]}")
+
+            trace.append(_trace_entry(
+                step       = step,
+                kind       = "act",
+                content    = name,
+                tool_name  = name,
+                tool_args  = args,
+                tool_result= result,
+            ))
+            step += 1
+
+            messages.append({
+                "role":         "tool",
+                "tool_call_id": tool_call.id,
+                "content":      json.dumps(result),
+            })
+
+            if (
+                name == stop_tool
+                and isinstance(result, dict)
+                and result.get("success")
+            ):
+                terminal   = result
+                stop_fired = True
+
+        # ── 6. If the stop tool fired, get the explanation ────
+        if stop_fired:
+            try:
+                final = _groq_call(messages, tools=None)
+                explanation = (final.choices[0].message.content or "").strip()
+                if explanation:
+                    trace.append(_trace_entry(step, "explain", explanation))
+                    step += 1
+            except Exception:
+                # Empty explanation — the public-facing function will
+                # synthesise a fallback string from the queued track.
+                pass
+            break
+
+    return {"queued": terminal, "explanation": explanation}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SCORED FALLBACK  (safety net when the ReAct loop can't commit)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _best_fallback(candidates: list[dict], state: dict) -> dict:
+    """
+    Pick the candidate closest to the current state on energy + valence,
+    penalising BPM / Camelot incompatibility. Used when the model exits
+    the loop without queuing a track.
     """
     if not candidates:
         return {}
@@ -272,15 +493,42 @@ def _best_fallback(
     scored = sorted(candidates, key=score)
 
     if DISPLAY_LOGS:
-        print("\n[fallback] Scored candidates:")
+        print("\n[fallback] scored candidates:")
         for c in scored[:6]:
-            s = score(c)
-            bpm_sym = "✓" if c.get("bpm_ok", True) else "✗"
+            s       = score(c)
+            bpm_sym = "✓" if c.get("bpm_ok",     True) else "✗"
             cam_sym = "✓" if c.get("camelot_ok", True) else "✗"
             print(f"  {s:.2f} — {c['name']} — {c['artist']}  (bpm={bpm_sym}  key={cam_sym})")
-        print(f"  → Best: {scored[0]['name']} — {scored[0]['artist']}")
+        print(f"  → best: {scored[0]['name']} — {scored[0]['artist']}")
 
     return scored[0]
+
+
+def _state_to_fallback_query(state: dict) -> str:
+    """
+    Build a contextual search query from the listener state. Used when
+    the model exhausts iterations without queuing — preferable to a
+    generic 'popular music' bag.
+    """
+    energy  = state.get("energy",  0.5)
+    valence = state.get("valence", 0.5)
+
+    energy_word = (
+        "high energy" if energy > 0.65 else
+        "low energy"  if energy < 0.35 else
+        "moderate"
+    )
+    mood_word = (
+        "uplifting"    if valence > 0.65 else
+        "melancholic"  if valence < 0.35 else
+        "neutral"
+    )
+    return f"{energy_word} {mood_word}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PUBLIC API — run_agent_cycle
+# ══════════════════════════════════════════════════════════════════════════════
 
 def run_agent_cycle(
     feedback_event:  str | None = None,
@@ -289,433 +537,205 @@ def run_agent_cycle(
     verbose:         bool = True,
 ) -> dict:
     """
-    Single-shot agent cycle — collect all context in Python, then make
-    one Gemini call to reason and select the next track.
+    One per-track ReAct cycle.
+
+    Feedback (if any) is applied in Python BEFORE the loop so that
+    get_listener_state will return the post-feedback vector when the
+    model reads it. The feedback is recorded at step 0 in the trace.
+
+    Returns:
+      {
+        "explanation":  str,
+        "queued_track": dict | None,
+        "trace":        list[dict],
+        "success":      bool,
+      }
     """
     trace: list[dict] = []
     tool_module.DISPLAY_LOGS = DISPLAY_LOGS
 
-    # ── Step 1: Apply feedback if provided ───────────────────
+    # ── 1. Apply feedback in Python (step 0) ──────────────────
     if feedback_event and feedback_track and feedback_artist:
-        result = tool_module.update_listener_state(
+        fb_result = tool_module.update_listener_state(
             feedback_event, feedback_track, feedback_artist
         )
-        trace.append(_make_trace_entry(
-            step=0, kind="act",
-            content=f"Applied feedback: {feedback_event} on {feedback_track}",
-            tool_name="update_listener_state",
-            tool_args={"event": feedback_event, "track_name": feedback_track, "artist": feedback_artist},
-            tool_result=result,
+        trace.append(_trace_entry(
+            step        = 0,
+            kind        = "act",
+            content     = f"Applied feedback: {feedback_event} on {feedback_track}",
+            tool_name   = "update_listener_state",
+            tool_args   = {
+                "event":      feedback_event,
+                "track_name": feedback_track,
+                "artist":     feedback_artist,
+            },
+            tool_result = fb_result,
         ))
         if verbose:
             print(f"\n[feedback] {feedback_event} on '{feedback_track}'")
 
-    # ── Step 2: Collect all context in Python ─────────────────
-    if verbose:
-        print("\n[observe] Collecting session context...")
-
-    state   = tool_module.get_listener_state()
-    arc     = tool_module.get_session_arc()
-    playback= tool_module.get_current_playback()
-    history = tool_module.get_session_history()
-    queue   = tool_module.get_queue_state()
-
-    # Record each context call individually in the trace
-    for tool_name, result in [
-        ("get_listener_state",  state),
-        ("get_session_arc",     arc),
-        ("get_current_playback",playback),
-        ("get_session_history", history),
-        ("get_queue_state",     queue),
-    ]:
-        trace.append(_make_trace_entry(
-            step=1, kind="act",
-            content=f"Collected {tool_name}",
-            tool_name=tool_name,
-            tool_args={},
-            tool_result=result,
-        ))
-
-    # ── Step 3: Search for candidates ────────────────────────
-    if verbose:
-        print("[observe] Searching for candidates...")
-
-    current_track_id = playback.get("track_id", "")
-    current_artist   = playback.get("artist", "").lower()
-
-    # Use Last.fm similar artists as search seeds for stylistically relevant results.
-    # Fall back to a mood query if the current artist is unknown or Last.fm returns nothing.
-    similar_artists = lastfm_client.get_similar_artists(current_artist, limit=5) if current_artist else []
-
-    if similar_artists:
-        searches = [tool_module.search_tracks(f"artist:{a}", limit=2) for a in similar_artists]
-        query_desc = f"similar artists: {', '.join(similar_artists)}"
-    else:
-        energy_word  = "energetic upbeat" if state["energy"] > 0.6 else "calm relaxing"
-        valence_word = "happy positive"   if state["valence"] > 0.6 else "melancholic dark"
-        searches     = [tool_module.search_tracks(f"{energy_word} {valence_word}", limit=8)]
-        query_desc   = f"{energy_word} {valence_word}"
-
-    all_candidates = []
-    for s in searches:
-        all_candidates.extend(s.get("candidates", []))
-
-    # Deduplicate by track id
-    seen = set()
-    candidates = []
-    for c in all_candidates:
-        if c["id"] not in seen:
-            seen.add(c["id"])
-            candidates.append(c)
-
-    # Exclude the currently playing track and all tracks by the same artist
-    if current_artist:
-        candidates = [
-            c for c in candidates
-            if c["id"] != current_track_id
-            and c["artist"].lower() != current_artist
-        ]
-
-    trace.append(_make_trace_entry(step=2, kind="observe",
-        content=f"Found {len(candidates)} candidates",
-        tool_result={"count": len(candidates), "query": query_desc}))
-
-    if verbose:
-        print(f"[observe] Found {len(candidates)} candidates")
-
-    if DISPLAY_LOGS:
-        print(f"\n[candidates] {len(candidates)} tracks found:")
-        for i, c in enumerate(candidates, 1):
-            bpm = c.get("bpm") or "—"
-            key = c.get("camelot_position") or "—"
-            print(f"  {i:2}. {c['name']} — {c['artist']}  (BPM={bpm}  Key={key})")
-
-    # ── Step 4: Check compatibility for each candidate ───────
-    if verbose:
-        print("[observe] Checking compatibility...")
-
-    hist_items   = history.get("recent", [])
-    current_bpm  = hist_items[0].get("bpm") if hist_items else None
-    current_camelot = hist_items[0].get("camelot_position") if hist_items else None
-
-    if DISPLAY_LOGS:
-        print(f"\n[compare loop] current track BPM={current_bpm or '—'}  Key={current_camelot or '—'}")
-
-    # Add compatibility scores to each candidate
-    enriched_candidates = []
-    for c in candidates[:8]:   # limit to top 8
-        enriched = dict(c)
-
-        # BPM compatibility
-        if current_bpm and c.get("bpm"):
-            bpm_check = tool_module.estimate_bpm_compatibility(
-                current_bpm, c["bpm"], arc["arc_phase"]
-            )
-            enriched["bpm_ok"]   = bpm_check["acceptable"]
-            enriched["bpm_diff"] = bpm_check["difference"]
-        else:
-            enriched["bpm_ok"]   = True
-            enriched["bpm_diff"] = 0
-
-        # Camelot (harmonic) compatibility
-        current_key   = camelot_parse(current_camelot or "")
-        candidate_key = camelot_parse(c.get("camelot_position") or "")
-        if current_key and candidate_key:
-            score = compatibility_strength(current_key, candidate_key)
-            enriched["camelot_ok"]    = score >= 0.4
-            enriched["camelot_score"] = round(score, 2)
-        else:
-            enriched["camelot_ok"]    = True   # unknown key — no penalty
-            enriched["camelot_score"] = None
-
-        if DISPLAY_LOGS:
-            bpm_sym = "✓" if enriched["bpm_ok"] else "✗"
-            cam_sym = "✓" if enriched["camelot_ok"] else "✗"
-            print(f"\n  [compare] {c['name']} — {c['artist']}")
-            if current_bpm and c.get("bpm"):
-                print(f"    BPM    : {current_bpm} → {c['bpm']}  diff={enriched['bpm_diff']}  ok={bpm_sym}")
-            else:
-                print(f"    BPM    : unknown (no penalty)")
-            if enriched.get("camelot_score") is not None:
-                print(f"    Key    : {current_camelot} → {c.get('camelot_position')}  "
-                      f"score={enriched['camelot_score']}  ok={cam_sym}")
-            else:
-                print(f"    Key    : unknown (no penalty)")
-            e_dist = abs(c.get("energy_est", 0.5) - state.get("energy", 0.5))
-            v_dist = abs(c.get("valence_est", 0.5) - state.get("valence", 0.5))
-            print(f"    Energy : |{state.get('energy', 0.5):.2f} - {c.get('energy_est', 0.5):.2f}| = {e_dist:.2f}")
-            print(f"    Valence: |{state.get('valence', 0.5):.2f} - {c.get('valence_est', 0.5):.2f}| = {v_dist:.2f}")
-
-        enriched_candidates.append(enriched)
-
-    trace.append(_make_trace_entry(step=3, kind="observe",
-        content="Compatibility checked for all candidates",
-        tool_result={"candidates_checked": len(enriched_candidates)}))
-
-    # ── Step 5: Single Gemini call to reason and select ──────
-    if verbose:
-        print("[think] Asking Gemini to select the best track...")
-
-    # Apply name-based exclusion as a second layer for robustness.
-    played_names = tool_module._queued_names   # direct access to the set
-
-    fresh_candidates = [
-        c for c in enriched_candidates
-        if c.get("name", "").lower() not in played_names
+    # ── 2. Build initial messages ─────────────────────────────
+    context_note = (
+        f" The listener just triggered a '{feedback_event}' on the current track —"
+        " factor that into your reasoning."
+        if feedback_event else ""
+    )
+    messages: list[dict] = [
+        {"role": "system", "content": CYCLE_SYSTEM_PROMPT},
+        {"role": "user",   "content": f"Select and queue the next track.{context_note}"},
     ]
 
-    if not fresh_candidates:
-        fresh_candidates = enriched_candidates   # nothing new — rare edge case
-
-    # Build a compact prompt with all context
-    prompt = f"""You are an Agentic DJ. Select the best next track.
-
-
-LISTENER STATE:
-{json.dumps(state, indent=2)}
-
-SESSION ARC:
-{json.dumps(arc, indent=2)}
-
-CURRENT PLAYBACK:
-{json.dumps(playback, indent=2)}
-
-CANDIDATE TRACKS (already enriched with tags and compatibility):
-{json.dumps(fresh_candidates, indent=2)}
-
-INSTRUCTIONS:
-1. Select the single best track from the candidates above.
-2. Consider: energy match, valence match, arc phase, BPM compatibility.
-3. Avoid tracks with bpm_ok=False unless no alternative exists.
-4. Respond with valid JSON only — no markdown, no extra text:
-
-{{
-  "selected_name": "<exact track name from candidates>",
-  "selected_artist": "<exact artist from candidates>",
-  "reasoning": "<2-3 sentences explaining the choice, mentioning at least one musical property>",
-  "explanation_for_listener": "<1-2 plain sentences for the listener, no jargon>"
-}}"""
-
-    try:
-        raw = _call_gemini_with_retry(
-            prompt=prompt,
-            system="You are an expert DJ assistant. Always respond with valid JSON only.",
-        )
-        raw         = raw.replace("```json", "").replace("```", "").strip()
-        selection   = json.loads(raw)
-
-        # Validate the selection refers to an actual candidate
-        valid_names = {c["name"].lower() for c in fresh_candidates}
-        if selection.get("selected_name", "").lower() not in valid_names:
-            raise ValueError(f"Gemini selected unknown track: {selection.get('selected_name')}")
-
-        if DISPLAY_LOGS:
-            print(f"\n[selected] Gemini → \"{selection['selected_name']}\" by {selection['selected_artist']}")
-            print(f"  Reasoning: {selection.get('reasoning', '')[:200]}")
-
-    except Exception as e:
-        if verbose or DISPLAY_LOGS:
-            print(f"[fallback] Gemini parse failed ({e}) — using scored fallback")
-        best = _best_fallback(fresh_candidates, state)
-        if not best:
-            return {
-                "explanation":  "Could not find a suitable track.",
-                "queued_track": None,
-                "trace":        trace,
-                "steps":        4,
-                "success":      False,
-            }
-        selection = {
-            "selected_name":            best["name"],
-            "selected_artist":          best["artist"],
-            "reasoning":                f"Fallback selection — closest energy/valence match to current state.",
-            "explanation_for_listener": f"Up next: {best['name']} by {best['artist']}.",
-        }
-
-    trace.append(_make_trace_entry(step=4, kind="think",
-        content=selection.get("reasoning", ""),
-        tool_result=selection))
-
     if verbose:
-        print(f"\n[think] {selection.get('reasoning', '')[:200]}")
+        print("\n[react] starting cycle…")
 
-    # ── Step 7: Queue the selected track ─────────────────────
-    queue_result = tool_module.add_track_to_queue(
-        selection["selected_name"],
-        selection["selected_artist"],
-    )
+    # ── 3. Run the ReAct loop ─────────────────────────────────
+    result = _run_react_loop(messages, trace=trace)
 
-    if not queue_result.get("success") and queue_result.get("duplicate"):
-        if verbose:
-            print(f"[retry] '{selection['selected_name']}' already played "
-                  f"— trying next best candidate")
-
-        remaining = sorted(
-            [
-                c for c in fresh_candidates
-                if c.get("name", "").lower() != selection["selected_name"].lower()
-                and c.get("name", "").lower() not in tool_module._queued_names
-            ],
-            key=lambda c: (
-                abs(c.get("energy_est",  0.5) - state["energy"]) +
-                abs(c.get("valence_est", 0.5) - state["valence"])
-            ),
-        )
-
-        for alt in remaining:
-            queue_result = tool_module.add_track_to_queue(
-                alt["name"], alt["artist"]
-            )
-            if queue_result.get("success"):
-                selection["selected_name"]            = alt["name"]
-                selection["selected_artist"]          = alt["artist"]
-                selection["explanation_for_listener"] = (
-                    f"Up next: {alt['name']} by {alt['artist']}."
+    # ── 4. Fallback if no track queued ────────────────────────
+    if not result.get("queued"):
+        if verbose or DISPLAY_LOGS:
+            print("[fallback] loop did not queue — using scored fallback")
+        state      = tool_module.get_listener_state()
+        query      = _state_to_fallback_query(state)
+        candidates = tool_module.search_tracks(query, limit=8).get("candidates", [])
+        best       = _best_fallback(candidates, state)
+        if best:
+            queue_result    = tool_module.add_track_to_queue(best["name"], best["artist"])
+            result["queued"] = queue_result
+            if not result.get("explanation"):
+                result["explanation"] = (
+                    f"Up next: {best['name']} by {best['artist']} — chosen as the closest "
+                    f"match to the current state when the agent could not converge."
                 )
-                break
 
-    explanation = selection.get("explanation_for_listener", "")
+    # ── 5. Normalise return shape ─────────────────────────────
+    queued      = result.get("queued") or {}
+    explanation = result.get("explanation", "")
 
-    trace.append(_make_trace_entry(
-        step=5, kind="act",
-        content=f"Queued {selection['selected_name']}",
-        tool_name="add_track_to_queue",
-        tool_args={
-            "track_name": selection["selected_name"],
-            "artist":     selection["selected_artist"],
-        },
-        tool_result=queue_result,
-    ))
+    if not explanation:
+        q = queued.get("queued", {}) if isinstance(queued, dict) else {}
+        if q:
+            explanation = f"Up next: {q.get('name')} by {q.get('artist')}."
+
+    success = isinstance(queued, dict) and queued.get("success", False)
 
     if verbose:
         print(f"\n[explain] {explanation}")
         print(f"\n{'='*55}")
-        success = queue_result.get("success", False)
-        print(f"Cycle complete — {'success' if success else 'no active device'}")
-        if queue_result.get("queued"):
-            q = queue_result["queued"]
-            print(f"Queued: {q.get('name')} — {q.get('artist')}")
+        print(f"Cycle complete — {'success' if success else 'failed'}")
         print(f"{'='*55}\n")
 
     return {
         "explanation":  explanation,
-        "queued_track": queue_result.get("queued"),
+        "queued_track": queued.get("queued") if isinstance(queued, dict) else None,
         "trace":        trace,
-        "steps":        6,
-        "success":      queue_result.get("success", False),
+        "success":      success,
     }
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  PUBLIC API — start_session
+# ══════════════════════════════════════════════════════════════════════════════
+
 def start_session(description: str, verbose: bool = False) -> dict:
     """
-    Start a new session from a natural language description.
+    Bootstrap a new session from a natural-language description.
 
-    Uses Gemini to interpret the vibe, searches for a strong opening track,
-    starts it playing on Spotify immediately, and seeds the listener state
-    vector from the inferred mood values.
+    Two-phase design:
+      1. Structured extraction (single Groq call): parse the description
+         into a vibe vector — energy, valence, focus, openness, social,
+         search_queries, session_label, confident.
+      2. ReAct sub-loop (focused 3-tool subset): the model searches
+         Spotify, inspects candidates, and commits one opener via the
+         synthetic select_opening_track tool.
 
-    Returns a dict with success, session_label, opening_track, fallback_used.
+    Python handles the Spotify play() and session-state recording around
+    the loop — those are mechanics, not reasoning.
+
+    Returns:
+      success:        {"success": True, "session_label", "opening_track",
+                       "fallback_used", "explanation", "trace"}
+      failure:        {"success": False, "error": "no_device"|"no_candidates",
+                       "session_label", "trace"}
     """
     import random
+
+    trace: list[dict] = []
+    tool_module.DISPLAY_LOGS = DISPLAY_LOGS
 
     if verbose:
         print(f"\n[start_session] '{description}'")
 
-    # ── Step 1: Gemini interprets the description ─────────────
-    system = (
-        "You are an Agentic DJ. Interpret a listener's session description "
-        "and return structured JSON to guide music selection."
-    )
-    prompt = f"""Interpret this listening session description and return ONLY valid JSON (no markdown):
+    # ── 1. Interpret the description (structured JSON) ────────
+    vibe = _interpret_description(description, trace, verbose=verbose)
 
-{{
-  "energy":         <float 0.0-1.0, how energetic/intense>,
-  "valence":        <float 0.0-1.0, how happy/positive vs dark/sad>,
-  "focus":          <float 0.0-1.0, how focused vs party/social>,
-  "openness":       <float 0.0-1.0, how open to variety>,
-  "social":         <float 0.0-1.0, how social/group vs solo>,
-  "search_queries": ["<3 specific Spotify search strings that match the vibe>"],
-  "session_label":  "<short label summarising the vibe, e.g. '2016 clubbing vibes'>",
-  "confident":      <true if description has clear musical signal, false if vague or meaningless>
-}}
+    session_label   = (vibe or {}).get("session_label", description[:50]) or description[:50]
+    confident       = bool((vibe or {}).get("confident", False))
+    search_queries  = (vibe or {}).get("search_queries", []) or []
+    target_energy   = float((vibe or {}).get("energy",   0.5))
+    target_valence  = float((vibe or {}).get("valence",  0.5))
+    target_focus    = float((vibe or {}).get("focus",    0.5))
+    target_openness = float((vibe or {}).get("openness", 0.7))
+    target_social   = float((vibe or {}).get("social",   0.3))
 
-Description: "{description}"
-"""
-
-    vibe = None
-    try:
-        raw = _call_gemini_with_retry(prompt, system)
-        # Strip markdown code fences if Gemini wraps its response
-        if "```" in raw:
-            raw = raw.split("```")[1]
-            if raw.startswith("json"):
-                raw = raw[4:]
-        vibe = json.loads(raw.strip())
-    except Exception as e:
-        if verbose:
-            print(f"[start_session] Gemini parse failed: {e}")
-
-    session_label  = (vibe or {}).get("session_label", description[:50]) or description[:50]
-    confident      = (vibe or {}).get("confident", False)
-    search_queries = (vibe or {}).get("search_queries", [])
-    target_energy  = float((vibe or {}).get("energy",  0.5))
-    target_valence = float((vibe or {}).get("valence", 0.5))
-
-    # ── Step 2: Reset session and apply inferred state ────────
+    # ── 2. Reset session & seed the state vector ──────────────
     tool_module.reset_session("general")
     if vibe:
         tool_module._state = init_state_from_values(
-            energy=target_energy,
-            valence=target_valence,
-            focus=float(vibe.get("focus",   0.5)),
-            openness=float(vibe.get("openness", 0.7)),
-            social=float(vibe.get("social",  0.3)),
+            energy   = target_energy,
+            valence  = target_valence,
+            focus    = target_focus,
+            openness = target_openness,
+            social   = target_social,
         )
 
-    # ── Step 3: Search for candidates ────────────────────────
-    candidates = []
+    # ── 3. ReAct sub-loop to pick the opener ──────────────────
+    selected: dict | None = None
     if confident and search_queries:
-        seen_ids: set[str] = set()
-        for q in search_queries[:3]:
-            result = tool_module.search_tracks(q, limit=3)
-            for c in result.get("candidates", []):
-                if c["id"] not in seen_ids:
-                    seen_ids.add(c["id"])
-                    candidates.append(c)
+        selected = _react_pick_opener(
+            label          = session_label,
+            vibe           = vibe or {},
+            search_queries = search_queries,
+            trace          = trace,
+            verbose        = verbose,
+        )
 
-    # ── Step 4: Score by energy+valence proximity + recognizability ──
-    def _score(c: dict) -> float:
-        energy_match  = 1.0 - abs(c.get("energy_est",  0.5) - target_energy)
-        valence_match = 1.0 - abs(c.get("valence_est", 0.5) - target_valence)
-        popularity    = min(c.get("listeners", 0), 1_000_000) / 1_000_000
-        return energy_match + valence_match + 0.3 * popularity
-
-    best_candidate = max(candidates, key=_score) if candidates else None
-
-    # ── Step 5: Fallback to user's top tracks ────────────────
+    # ── 4. Resolve to an actual SpotifyTrack ──────────────────
     fallback_used = False
-    if not best_candidate or not confident:
+    sp_track      = None
+
+    if selected:
+        results = tool_module._spotify.search(
+            f"{selected['name']} {selected['artist']}", limit=1
+        )
+        if results:
+            sp_track = results[0]
+
+    if sp_track is None:
+        # Either the model gave nothing usable or vibe parsing failed
         fallback_used = True
-        top_tracks = tool_module._spotify.get_top_tracks(limit=20)
+        top_tracks    = tool_module._spotify.get_top_tracks(limit=20)
         if not top_tracks:
-            return {"success": False, "error": "no_candidates", "session_label": session_label}
+            return {
+                "success":       False,
+                "error":         "no_candidates",
+                "session_label": session_label,
+                "trace":         trace,
+            }
         sp_track = random.choice(top_tracks)
         if not confident:
             session_label = "Your recent favourites"
-    else:
-        # Resolve a SpotifyTrack object for play() from the best candidate
-        results = tool_module._spotify.search(
-            f"{best_candidate['name']} {best_candidate['artist']}", limit=1
-        )
-        if not results:
-            return {"success": False, "error": "no_candidates", "session_label": session_label}
-        sp_track = results[0]
 
-    # ── Step 6: Start immediate playback ─────────────────────
+    # ── 5. Start immediate playback ───────────────────────────
     if not tool_module._spotify.play(sp_track):
-        return {"success": False, "error": "no_device", "session_label": session_label}
+        return {
+            "success":       False,
+            "error":         "no_device",
+            "session_label": session_label,
+            "trace":         trace,
+        }
 
-    # ── Step 7: Record opening track in session state ─────────
+    # ── 6. Record the opening track in session state ──────────
     candidate = tool_module._record_played_track(sp_track)
 
     if verbose:
@@ -727,8 +747,171 @@ Description: "{description}"
         "session_label": session_label,
         "opening_track": candidate,
         "fallback_used": fallback_used,
+        "trace":         trace,
         "explanation":   (
             f"Starting with '{sp_track.name}' by {sp_track.artist} "
             f"for your '{session_label}' session."
         ),
     }
+
+
+# ── start_session internals ───────────────────────────────────────────────────
+
+def _interpret_description(
+    description: str,
+    trace:       list[dict],
+    verbose:     bool = False,
+) -> dict | None:
+    """
+    Single structured-JSON Groq call. Returns the parsed vibe dict on
+    success, None on parse failure. Records a 'think' trace entry either
+    way so the bootstrap reasoning is visible to post-hoc analysis.
+    """
+    user_msg = SESSION_INTERPRET_USER.format(description=description)
+
+    try:
+        response = _groq_call(
+            messages = [
+                {"role": "system", "content": SESSION_INTERPRET_SYSTEM},
+                {"role": "user",   "content": user_msg},
+            ],
+            tools = None,
+        )
+        raw = (response.choices[0].message.content or "").strip()
+
+        # Strip markdown fences if the model added them despite the system prompt
+        if "```" in raw:
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        parsed = json.loads(raw.strip())
+
+        trace.append(_trace_entry(
+            step       = 0,
+            kind       = "think",
+            content    = (
+                f"Interpreted vibe → label='{parsed.get('session_label', '?')}' "
+                f"energy={parsed.get('energy')} valence={parsed.get('valence')} "
+                f"confident={parsed.get('confident')}"
+            ),
+            tool_result= parsed,
+        ))
+        if verbose:
+            print(f"[interpret] {parsed.get('session_label')}  confident={parsed.get('confident')}")
+        return parsed
+
+    except Exception as exc:
+        trace.append(_trace_entry(
+            step    = 0,
+            kind    = "think",
+            content = f"Vibe interpretation failed: {exc}",
+        ))
+        if verbose:
+            print(f"[interpret] failed: {exc}")
+        return None
+
+
+def _react_pick_opener(
+    label:          str,
+    vibe:           dict,
+    search_queries: list[str],
+    trace:          list[dict],
+    verbose:        bool = False,
+) -> dict | None:
+    """
+    Focused ReAct sub-loop that asks the model to pick an opening track.
+
+    Uses a 3-tool inner toolset:
+      - search_tracks       (real tool from tool_module)
+      - get_track_details   (real tool from tool_module)
+      - select_opening_track (synthetic terminal — defined inline here so
+                              the public 12-tool catalogue stays untouched)
+
+    Returns the chosen {name, artist} dict, or None if the model fails
+    to commit within the iteration budget.
+    """
+    choice: dict[str, Any] = {}
+
+    def select_opening_track(track_name: str, artist: str) -> dict:
+        """Synthetic terminal tool — records the choice and stops the loop."""
+        choice["name"]   = track_name
+        choice["artist"] = artist
+        return {"success": True, "selected": {"name": track_name, "artist": artist}}
+
+    inner_registry: dict[str, Any] = {
+        "search_tracks":         tool_module.search_tracks,
+        "get_track_details":     tool_module.get_track_details,
+        "select_opening_track":  select_opening_track,
+    }
+
+    inner_tools_schema: list[dict] = [
+        {"type": "function", "function": {
+            "name":        "search_tracks",
+            "description": "Search Spotify for candidate tracks enriched with Last.fm tags and energy/valence estimates.",
+            "parameters":  {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "limit": {"type": "integer"},
+                },
+                "required": ["query"],
+            },
+        }},
+        {"type": "function", "function": {
+            "name":        "get_track_details",
+            "description": "Get full details for a specific track — metadata, tags, energy, valence, BPM, key.",
+            "parameters":  {
+                "type": "object",
+                "properties": {
+                    "track_name": {"type": "string"},
+                    "artist":     {"type": "string"},
+                },
+                "required": ["track_name", "artist"],
+            },
+        }},
+        {"type": "function", "function": {
+            "name":        "select_opening_track",
+            "description": "Terminal action: commit the chosen opening track. Call exactly once with a track you have actually seen in a search result.",
+            "parameters":  {
+                "type": "object",
+                "properties": {
+                    "track_name": {"type": "string"},
+                    "artist":     {"type": "string"},
+                },
+                "required": ["track_name", "artist"],
+            },
+        }},
+    ]
+
+    queries_text = "\n".join(f"  • {q}" for q in search_queries[:3])
+    user_msg = (
+        f"Session vibe: {label}\n"
+        f"Inferred listener state — "
+        f"energy={float(vibe.get('energy', 0.5)):.2f}, "
+        f"valence={float(vibe.get('valence', 0.5)):.2f}, "
+        f"focus={float(vibe.get('focus', 0.5)):.2f}.\n\n"
+        f"Suggested search queries:\n{queries_text}\n\n"
+        f"Pick and commit the opening track."
+    )
+
+    messages: list[dict] = [
+        {"role": "system", "content": SESSION_PICK_SYSTEM},
+        {"role": "user",   "content": user_msg},
+    ]
+
+    if verbose:
+        print("\n[start_session/react] picking opener…")
+
+    result = _run_react_loop(
+        messages       = messages,
+        trace          = trace,
+        max_iterations = 8,
+        registry       = inner_registry,
+        tools_schema   = inner_tools_schema,
+        stop_tool      = "select_opening_track",
+        log_prefix     = "open ",
+    )
+
+    if result.get("queued") and choice.get("name") and choice.get("artist"):
+        return {"name": choice["name"], "artist": choice["artist"]}
+    return None
