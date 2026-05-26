@@ -27,6 +27,7 @@ Architecture:
 
 import json
 import os
+import threading
 import time
 from typing import Any
 
@@ -35,12 +36,13 @@ from dotenv import load_dotenv
 
 from agentic_dj.agent import tools as tool_module
 from agentic_dj.agent.state import init_state_from_values
+from agentic_dj.music.tags import prewarm_embedding_model
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-MODEL  = "llama-3.3-70b-versatile"
+MODEL  = "openai/gpt-oss-120b"
 
 DISPLAY_LOGS: bool = True       # set False to silence the trace stream
 MAX_ITERATIONS:       int = 15  # safety cap on a single ReAct loop
@@ -117,12 +119,24 @@ TOOL_DECLARATIONS: list[dict] = [
     },
     {
         "name": "search_tracks",
-        "description": "Search Spotify for candidate tracks enriched with Last.fm tags and energy/valence estimates.",
+        "description": "Search Spotify for candidate tracks enriched with Last.fm tags and energy/valence estimates. Use for specific artist or track lookups mid-session.",
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {"type": "string"},
                 "limit": {"type": "integer"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "search_tracks_by_playlist",
+        "description": "Search for Spotify playlists matching a vibe, era, or mood description and return a sample of tracks from those playlists. Prefer this over search_tracks for descriptive queries like '2016 pop hits' or 'chill Sunday morning'. Returns raw metadata only — no BPM or key data.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query":       {"type": "string",  "description": "Short playlist-style search string, e.g. '2016 pop hits'"},
+                "sample_size": {"type": "integer", "description": "Max candidates to return (default 20)"},
             },
             "required": ["query"],
         },
@@ -182,6 +196,7 @@ TOOL_REGISTRY: dict[str, Any] = {
     "check_transition":           tool_module.check_transition,
     "estimate_bpm_compatibility": tool_module.estimate_bpm_compatibility,
     "search_tracks":              tool_module.search_tracks,
+    "search_tracks_by_playlist":  tool_module.search_tracks_by_playlist,
     "get_track_details":          tool_module.get_track_details,
     "get_current_playback":       tool_module.get_current_playback,
     "get_queue_state":            tool_module.get_queue_state,
@@ -238,7 +253,7 @@ with these fields:
   "focus":          <float 0.0-1.0, how focused vs party/social>,
   "openness":       <float 0.0-1.0, how open to variety>,
   "social":         <float 0.0-1.0, how social/group vs solo>,
-  "search_queries": ["<3 specific Spotify search strings that match the vibe>"],
+  "search_queries": ["<3 short playlist-style strings, 2-4 words, e.g. '2016 pop hits', 'chill Sunday morning pop', 'late night R&B'>"],
   "session_label":  "<short evocative label, e.g. '2016 clubbing vibes'>",
   "confident":      <true if the description has clear musical signal, false if vague>
 }}
@@ -250,9 +265,10 @@ SESSION_PICK_SYSTEM = """\
 You are an Agentic DJ choosing the OPENING track for a new listening session.
 
 Toolbox (focused subset):
-  • search_tracks(query, limit)         — find candidates
-  • get_track_details(track_name, artist) — inspect one in detail
-  • select_opening_track(track_name, artist)  — terminal action, call once
+  • search_tracks_by_playlist(query)      — preferred for vibe/era/mood queries
+  • search_tracks(query, limit)           — use only for specific artist/track lookups
+  • get_track_details(track_name, artist) — optional: full profile for one candidate
+  • select_opening_track(track_name, artist) — terminal action, call once
 
 Reason about which track best opens the described session. Search using
 the suggested queries (or your own variants), examine candidates, then
@@ -735,6 +751,15 @@ def start_session(description: str, verbose: bool = False) -> dict:
             "trace":         trace,
         }
 
+    # ── 5b. Pre-warm the sentence-transformer in the background ──
+    # The model loads on first use inside get_track_details → estimate_features.
+    # Starting it here (as a daemon thread) means it will be ready before
+    # the first mid-session cycle runs, eliminating the cold-start spike.
+    _prewarm_thread = threading.Thread(
+        target=prewarm_embedding_model, daemon=True, name="st-prewarm"
+    )
+    _prewarm_thread.start()
+
     # ── 6. Record the opening track in session state ──────────
     candidate = tool_module._record_played_track(sp_track)
 
@@ -832,22 +857,97 @@ def _react_pick_opener(
     """
     choice: dict[str, Any] = {}
 
+    # Tracks every candidate the agent has actually seen this sub-loop.
+    # Keys are lowercase "name|artist" strings. select_opening_track
+    # validates against this set so the model cannot commit a track it
+    # never searched for.
+    seen_tracks: dict[str, dict] = {}   # "name|artist" → {name, artist}
+
+    def _register_candidates(candidates: list[dict]) -> None:
+        for c in candidates:
+            key = f"{c.get('name', '').lower()}|{c.get('artist', '').lower()}"
+            if key:
+                seen_tracks[key] = {"name": c["name"], "artist": c.get("artist", "")}
+
+    def _search_tracks_by_playlist_tracked(query: str, sample_size: int = 20) -> dict:
+        result = tool_module.search_tracks_by_playlist(query, sample_size)
+        _register_candidates(result.get("candidates", []))
+        return result
+
+    def _search_tracks_tracked(query: str, limit: int = 8) -> dict:
+        result = tool_module.search_tracks(query, limit)
+        _register_candidates(result.get("candidates", []))
+        return result
+
+    def _get_track_details_tracked(track_name: str, artist: str) -> dict:
+        result = tool_module.get_track_details(track_name, artist)
+        # get_track_details returns a flat candidate dict, not a list
+        if result.get("name") and not result.get("error"):
+            _register_candidates([result])
+        return result
+
     def select_opening_track(track_name: str, artist: str) -> dict:
-        """Synthetic terminal tool — records the choice and stops the loop."""
-        choice["name"]   = track_name
-        choice["artist"] = artist
-        return {"success": True, "selected": {"name": track_name, "artist": artist}}
+        """
+        Synthetic terminal tool — commits the opening track.
+        Rejects any track not seen in a prior search result this session,
+        forcing the model to pick from actual candidates rather than
+        falling back to its training knowledge.
+        """
+        key = f"{track_name.lower()}|{artist.lower()}"
+
+        # Exact match
+        if key in seen_tracks:
+            choice["name"]   = track_name
+            choice["artist"] = artist
+            return {"success": True, "selected": {"name": track_name, "artist": artist}}
+
+        # Partial name match (handles minor title punctuation differences)
+        name_lower = track_name.lower()
+        for k, v in seen_tracks.items():
+            if k.split("|")[0] == name_lower:
+                choice["name"]   = v["name"]
+                choice["artist"] = v["artist"]
+                return {"success": True, "selected": choice.copy()}
+
+        # Track was not in search results — reject and list what IS available
+        available = ", ".join(
+            f"'{v['name']}' by {v['artist']}"
+            for v in list(seen_tracks.values())[:6]
+        ) or "none yet — call search_tracks_by_playlist first"
+
+        return {
+            "success": False,
+            "error": (
+                f"'{track_name}' by {artist} was not in your search results "
+                f"and cannot be committed. You must select a track you have "
+                f"actually seen returned by a search tool this session. "
+                f"Available candidates include: {available}."
+            ),
+        }
 
     inner_registry: dict[str, Any] = {
-        "search_tracks":         tool_module.search_tracks,
-        "get_track_details":     tool_module.get_track_details,
-        "select_opening_track":  select_opening_track,
+        "search_tracks_by_playlist": _search_tracks_by_playlist_tracked,
+        "search_tracks":             _search_tracks_tracked,
+        "get_track_details":         _get_track_details_tracked,
+        "select_opening_track":      select_opening_track,
     }
 
     inner_tools_schema: list[dict] = [
         {"type": "function", "function": {
+            "name":        "search_tracks_by_playlist",
+            "description": "Search for Spotify playlists matching a vibe, era, or mood description and return a sample of tracks. Preferred for descriptive queries like '2016 pop hits'. Returns raw metadata only — no BPM or key.",
+            "parameters":  {
+                "type": "object",
+                "properties": {
+                    "query":       {"type": "string"},
+                    "sample_size": {"type": "integer"},
+                },
+                "required": ["query"],
+            },
+        }},
+        {"type": "function", "function": {
             "name":        "search_tracks",
-            "description": "Search Spotify for candidate tracks enriched with Last.fm tags and energy/valence estimates.",
+            "description": "Search Spotify for candidate tracks. Use only for specific artist or track lookups, not for vibe/era descriptions.",
             "parameters":  {
                 "type": "object",
                 "properties": {
@@ -871,7 +971,7 @@ def _react_pick_opener(
         }},
         {"type": "function", "function": {
             "name":        "select_opening_track",
-            "description": "Terminal action: commit the chosen opening track. Call exactly once with a track you have actually seen in a search result.",
+            "description": "Terminal action: commit the chosen opening track. The track MUST have been returned by search_tracks_by_playlist, search_tracks, or get_track_details earlier in this session — any other name will be rejected with an error.",
             "parameters":  {
                 "type": "object",
                 "properties": {

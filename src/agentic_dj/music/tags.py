@@ -257,6 +257,18 @@ def _get_embedding_model():
     return _embedding_model, _lexicon_embeddings, _lexicon_keys
 
 
+def prewarm_embedding_model() -> None:
+    """
+    Eagerly load the sentence-transformer model and pre-compute lexicon
+    embeddings. Safe to call from a background thread.
+
+    Call this once at session start so the model is ready before the first
+    mid-session cycle needs it — avoids a cold-start spike mid-loop when
+    get_track_details encounters an unknown Last.fm tag.
+    """
+    _get_embedding_model()
+
+
 def _find_nearest_lexicon_tags(
     unknown_tag: str,
     top_k: int = 3,

@@ -259,10 +259,103 @@ def search_tracks(
         candidate = _spotify_to_candidate(sp_track, enrich=enrich)
         candidates.append(candidate)
 
+    # Filter out candidates that have no BPM AND no Camelot key.
+    # These tracks cannot be evaluated for harmonic or tempo compatibility
+    # and should never be committed ahead of tracks that do have data.
+    eligible   = [c for c in candidates if c.get("bpm") or c.get("camelot_position")]
+    filtered_n = len(candidates) - len(eligible)
+
+    if DISPLAY_LOGS and filtered_n:
+        print(f"  [search] dropped {filtered_n} candidate(s) missing both BPM and key")
+
+    # Fall back to the full set only if every candidate is missing data —
+    # this keeps the agent from receiving an empty result and searching again.
+    output = eligible if eligible else candidates
+
     return {
-        "query":      query,
-        "count":      len(candidates),
-        "candidates": candidates,
+        "query":                query,
+        "count":                len(output),
+        "candidates":           output,
+        "filtered_no_data":     filtered_n,
+        "all_missing_data":     not bool(eligible),
+    }
+
+
+def search_tracks_by_playlist(
+    query:       str,
+    sample_size: int = 20,
+) -> dict:
+    """
+    Search for Spotify playlists matching a vibe, era, or mood description,
+    then return a random sample of tracks from the top results.
+
+    Use this instead of search_tracks when the input is a descriptive phrase
+    such as '2016 pop hits', 'chill Sunday morning', or 'late night R&B'.
+    Playlist context is a far more reliable genre/era filter than free-text
+    track search for these kinds of queries.
+
+    Returns raw Spotify metadata only (name, artist, album, duration).
+    No energy, valence, tags, BPM, or key data — those are not needed when
+    choosing an opening track. Call get_track_details on your chosen candidate
+    if you need the full profile before committing.
+
+    Falls back to a raw track search if no playlists are found.
+    """
+    import random
+
+    playlists = _spotify.search_playlists(query, limit=5)
+
+    raw_tracks: list = []
+    playlists_used: list[str] = []
+
+    # Try all returned playlists until we have a usable pool.
+    # Spotify editorial playlists return 403 in Development Mode —
+    # get_playlist_tracks silently returns [] for those, so we keep
+    # trying until we find a user-created playlist that responds.
+    for pl in playlists:
+        if len(raw_tracks) >= sample_size * 2:
+            break
+        tracks = _spotify.get_playlist_tracks(pl["id"], limit=50)
+        if tracks:
+            raw_tracks.extend(tracks)
+            playlists_used.append(pl["name"])
+
+    # Fall back to regular track search if every playlist was empty/forbidden.
+    # Cap at 10 — Spotify's Development Mode rejects search limits above that.
+    if not raw_tracks:
+        fallback = _spotify.search(query, limit=min(sample_size, 10))
+        raw_tracks = fallback
+        playlists_used = []
+
+    random.shuffle(raw_tracks)
+
+    seen_ids: set[str] = set()
+    candidates: list[dict] = []
+    for sp_track in raw_tracks:
+        if len(candidates) >= sample_size:
+            break
+        if sp_track.id in _queued_ids:
+            continue
+        if sp_track.name.lower() in _queued_names:
+            continue
+        if sp_track.id in seen_ids:
+            continue
+        seen_ids.add(sp_track.id)
+        candidates.append({
+            "id":         sp_track.id,
+            "name":       sp_track.name,
+            "artist":     sp_track.artist,
+            "album":      sp_track.album,
+            "duration_s": round(sp_track.duration_ms / 1000),
+            "uri":        sp_track.uri,
+        })
+
+    return {
+        "query":          query,
+        "count":          len(candidates),
+        "candidates":     candidates,
+        "source":         "playlist" if playlists_used else "track_search",
+        "playlists_used": playlists_used,
     }
 
 

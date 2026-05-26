@@ -269,6 +269,85 @@ class SpotifyClient:
         except spotipy.SpotifyException:
             return []
 
+    def search_playlists(
+        self,
+        query: str,
+        limit: int = 5,
+    ) -> list[dict]:
+        """
+        Search for playlists matching a vibe, era, or mood description.
+        Returns playlist metadata — use get_playlist_tracks to fetch their tracks.
+
+        Each result dict contains: id, name, description, track_count, owner.
+        """
+        sp = self._get_sp()
+        results = sp.search(q=query, limit=limit, type="playlist")
+        playlists = results.get("playlists", {}).get("items", [])
+        out = []
+        for pl in playlists:
+            if not pl:
+                continue
+            tracks_info = pl.get("tracks") or {}
+            out.append({
+                "id":          pl.get("id", ""),
+                "name":        pl.get("name", ""),
+                "description": pl.get("description", ""),
+                "track_count": tracks_info.get("total", 0),
+                "owner":       (pl.get("owner") or {}).get("display_name", ""),
+            })
+        return out
+
+    def get_playlist_tracks(
+        self,
+        playlist_id: str,
+        limit: int = 50,
+    ) -> list[SpotifyTrack]:
+        """
+        Fetch tracks from a playlist by ID via RapidAPI.
+
+        Uses https://spotify81.p.rapidapi.com/playlist_tracks, which is
+        accessible for all public playlists. The official Spotify endpoint
+        (sp.playlist_items) returns 403 for playlists not owned by the
+        authenticated user, making it unusable for discovery.
+
+        Filters out local files (is_local on the item wrapper) and tracks
+        with a null id (region-locked or unavailable items).
+        Returns up to `limit` SpotifyTrack objects, or [] on any error.
+        """
+        import requests as _requests
+
+        api_key = os.getenv("RAPID_API_KEY")
+        if not api_key:
+            return []
+
+        try:
+            resp = _requests.get(
+                "https://spotify81.p.rapidapi.com/playlist_tracks",
+                headers={
+                    "x-rapidapi-key":  api_key,
+                    "x-rapidapi-host": "spotify81.p.rapidapi.com",
+                },
+                params={"id": playlist_id, "limit": limit, "offset": 0},
+                timeout=10,
+            )
+            if resp.status_code != 200:
+                return []
+
+            items = resp.json().get("items", [])
+            tracks = []
+            for item in items:
+                if not item:
+                    continue
+                if item.get("is_local"):       # is_local lives on the wrapper
+                    continue
+                track = item.get("track")
+                if not track or not track.get("id"):
+                    continue
+                tracks.append(self._parse_track(track))
+            return tracks
+        except Exception:
+            return []
+
     def get_saved_tracks(self, limit: int = 50) -> list[SpotifyTrack]:
         """
         Fetch the user's most recently saved tracks.
