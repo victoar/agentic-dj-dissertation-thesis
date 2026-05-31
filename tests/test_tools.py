@@ -13,6 +13,7 @@ from agentic_dj.agent.tools import (
     check_transition,
     estimate_bpm_compatibility,
     search_tracks,
+    search_tracks_by_playlist,
     get_track_details,
     get_current_playback,
     get_queue_state,
@@ -278,6 +279,73 @@ def run_tests():
     else:
         print("      Search returned no results — skipping _record_played_track live test")
         check("_record_played_track live test skipped gracefully", True)
+
+    # ── 16. search_tracks_by_playlist ───────────────────────
+    print("\n[16] search_tracks_by_playlist (live API)")
+    reset_session("general")
+    r = search_tracks_by_playlist("2016 pop hits", sample_size=10)
+    check("returns count key",           "count" in r)
+    check("returns candidates list",     "candidates" in r and isinstance(r["candidates"], list))
+    check("returns source key",          r.get("source") in ("playlist", "track_search"))
+    check("returns playlists_used list", isinstance(r.get("playlists_used"), list))
+    check("source is playlist",          r.get("source") == "playlist",
+          got=r.get("source"))
+    check("at least one candidate",      r["count"] > 0, got=r["count"])
+    if r["candidates"]:
+        c = r["candidates"][0]
+        check("candidate has id",         bool(c.get("id")))
+        check("candidate has name",       bool(c.get("name")))
+        check("candidate has artist",     bool(c.get("artist")))
+        check("candidate has duration_s", isinstance(c.get("duration_s"), int))
+        check("candidate has no energy_est (no enrichment)",
+              "energy_est" not in c)
+        check("candidate has no tags (no enrichment)",
+              "tags" not in c)
+        check("candidate has no bpm (no soundcharts)",
+              "bpm" not in c)
+        print(f"      source={r['source']}  playlists={r['playlists_used']}")
+        print(f"      {r['count']} candidates returned")
+        for cand in r["candidates"][:5]:
+            print(f"        • {cand['name']} — {cand['artist']}")
+
+    # ── 17. search_tracks_by_playlist deduplication (unit) ──
+    print("\n[17] search_tracks_by_playlist deduplication (monkeypatched)")
+    reset_session("general")
+
+    # Build two fake SpotifyTrack objects — one that should be blocked, one that passes
+    from agentic_dj.spotify.client import SpotifyTrack as ST
+    blocked = ST(id="blocked_id", name="Already Played Song", artist="Test Artist",
+                 album="Test Album", duration_ms=200_000, uri="spotify:track:blocked_id")
+    allowed = ST(id="allowed_id", name="Fresh Track",         artist="Other Artist",
+                 album="Other Album", duration_ms=180_000, uri="spotify:track:allowed_id")
+
+    # Inject the blocked track into the session guard
+    tool_module._queued_names.add(blocked.name.lower())
+    tool_module._queued_ids.add(blocked.id)
+
+    # Monkeypatch _spotify so no live API is needed
+    original_search_playlists    = tool_module._spotify.search_playlists
+    original_get_playlist_tracks = tool_module._spotify.get_playlist_tracks
+    tool_module._spotify.search_playlists    = lambda q, limit=5: [
+        {"id": "fake_pl_id", "name": "Fake Playlist", "track_count": 2, "owner": "test"}
+    ]
+    tool_module._spotify.get_playlist_tracks = lambda pid, limit=30: [blocked, allowed]
+
+    try:
+        r = search_tracks_by_playlist("any query", sample_size=10)
+        names = [c["name"] for c in r["candidates"]]
+        check("blocked track excluded from results",
+              blocked.name not in names, got=names)
+        check("allowed track included in results",
+              allowed.name in names, got=names)
+        check("count reflects dedup",
+              r["count"] == 1, got=r["count"])
+    finally:
+        # Always restore the real methods
+        tool_module._spotify.search_playlists    = original_search_playlists
+        tool_module._spotify.get_playlist_tracks = original_get_playlist_tracks
+        tool_module._queued_names.discard(blocked.name.lower())
+        tool_module._queued_ids.discard(blocked.id)
 
     # ── Summary ──────────────────────────────────────────────
     print(f"\n{'='*55}")

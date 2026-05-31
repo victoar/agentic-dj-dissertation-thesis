@@ -176,6 +176,49 @@ def run_tests():
     top_med = client.get_top_tracks(limit=5, time_range="medium_term")
     check("medium_term also returns a list", isinstance(top_med, list))
 
+    # ── Test 12: search_playlists ────────────────────────────
+    print("\n[12] search_playlists")
+    playlists = client.search_playlists("2016 hits", limit=3)
+    check("returns a list",              isinstance(playlists, list))
+    check("returns at least one result", len(playlists) > 0, got=len(playlists))
+    if playlists:
+        pl = playlists[0]
+        check("playlist has id",          bool(pl.get("id")))
+        check("playlist has name",        bool(pl.get("name")))
+        check("track_count is int >= 0",  isinstance(pl.get("track_count"), int)
+              and pl["track_count"] >= 0, got=pl.get("track_count"))
+        check("owner is a string",        isinstance(pl.get("owner"), str))
+        print(f"      Top playlist: '{pl['name']}' by {pl['owner']} "
+              f"({pl['track_count']} tracks)")
+        for p in playlists:
+            print(f"        • {p['name']} ({p['track_count']} tracks)")
+
+    # ── Test 13: get_playlist_tracks ─────────────────────────
+    print("\n[13] get_playlist_tracks")
+    if playlists:
+        playlist_id = playlists[0]["id"]
+        tracks = client.get_playlist_tracks(playlist_id, limit=10)
+        check("returns a list",                isinstance(tracks, list))
+        check("returns at least one track",    len(tracks) > 0, got=len(tracks))
+        check("no None entries",               all(t is not None for t in tracks))
+        if tracks:
+            check("tracks are SpotifyTrack objects",
+                  all(isinstance(t, SpotifyTrack) for t in tracks))
+            check("all tracks have non-empty id",
+                  all(bool(t.id) for t in tracks))
+            check("all tracks have non-empty name",
+                  all(bool(t.name) for t in tracks))
+            check("all tracks have non-empty artist",
+                  all(t.artist != "unknown" for t in tracks))
+            check("all tracks have valid uri",
+                  all(t.uri.startswith("spotify:track:") for t in tracks))
+            print(f"      {len(tracks)} tracks fetched from '{playlists[0]['name']}'")
+            for t in tracks[:3]:
+                print(f"        • {t.name} — {t.artist}")
+    else:
+        print("      No playlists from test 12 — skipping get_playlist_tracks test")
+        check("get_playlist_tracks skipped gracefully (no playlists)", True)
+
     # ── Summary ──────────────────────────────────────────────
     print(f"\n{'='*55}")
     print(f"Results: {passed} passed  {failed} failed")
