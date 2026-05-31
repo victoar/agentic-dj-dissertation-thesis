@@ -28,7 +28,12 @@ from agentic_dj.music.camelot import (
     compatibility_strength,
 )
 from agentic_dj.music.tags import estimate_features_with_fallback
-from agentic_dj.music.lastfm_client import enrich_track, fetch_enrichment
+from agentic_dj.music.lastfm_client import (
+    enrich_track,
+    fetch_enrichment,
+    get_top_tracks_for_tag,
+    get_artist_top_tracks_lastfm,
+)
 from agentic_dj.music.soundcharts_client import fetch_track_info
 from agentic_dj.spotify.client import SpotifyClient, SpotifyTrack
 
@@ -356,6 +361,100 @@ def search_tracks_by_playlist(
         "candidates":     candidates,
         "source":         "playlist" if playlists_used else "track_search",
         "playlists_used": playlists_used,
+    }
+
+
+def search_tracks_by_tag(tag: str, limit: int = 15) -> dict:
+    """
+    Search for tracks by Last.fm tag — the accurate way to find music by mood,
+    energy, or genre.
+
+    Use this instead of search_tracks when the query is descriptive:
+    e.g. 'energetic', 'chill', 'melancholic', 'dark', 'happy', 'anthemic',
+    'ambient', 'upbeat', 'mellow'. Last.fm's tag index is crowdsourced by
+    millions of listeners and maps directly to moods and genres. Spotify text
+    search does not understand these terms — it just matches them against
+    track titles.
+
+    Args:
+        tag:   a Last.fm mood/genre tag e.g. 'energetic', 'chill', 'dark'
+        limit: max candidates to return (default 15, max 20)
+
+    Returns enriched candidates with energy/valence estimates, same format
+    as search_tracks.
+    """
+    limit       = min(limit, 20)
+    raw_items   = get_top_tracks_for_tag(tag, limit=limit * 2)  # fetch extra — some won't resolve on Spotify
+
+    candidates = []
+    for item in raw_items:
+        if len(candidates) >= limit:
+            break
+        name   = item.get("name", "")
+        artist = item.get("artist", "")
+        if not name or not artist:
+            continue
+
+        results = _spotify.search(f"{name} {artist}", limit=1)
+        if not results:
+            continue
+        sp = results[0]
+
+        if sp.id in _queued_ids or sp.name.lower() in _queued_names:
+            continue
+
+        candidates.append(_spotify_to_candidate(sp, enrich=True))
+
+    return {
+        "tag":        tag,
+        "count":      len(candidates),
+        "candidates": candidates,
+    }
+
+
+def search_artist_tracks(artist: str, limit: int = 15) -> dict:
+    """
+    Get an artist's most popular tracks, resolved to Spotify.
+
+    Use this when the listener has expressed interest in a specific artist —
+    it fetches that artist's top tracks from Last.fm (ranked by listener count)
+    and resolves each to a Spotify-playable candidate. This is far more
+    reliable than search_tracks('artist name') which may return tribute acts,
+    covers, or unrelated results.
+
+    Args:
+        artist: artist name e.g. 'Radiohead', 'Daft Punk'
+        limit:  max candidates to return (default 15, max 20)
+
+    Returns enriched candidates with energy/valence estimates, same format
+    as search_tracks.
+    """
+    limit     = min(limit, 20)
+    raw_items = get_artist_top_tracks_lastfm(artist, limit=limit * 2)
+
+    candidates = []
+    for item in raw_items:
+        if len(candidates) >= limit:
+            break
+        name        = item.get("name", "")
+        item_artist = item.get("artist", artist)
+        if not name:
+            continue
+
+        results = _spotify.search(f"{name} {item_artist}", limit=1)
+        if not results:
+            continue
+        sp = results[0]
+
+        if sp.id in _queued_ids or sp.name.lower() in _queued_names:
+            continue
+
+        candidates.append(_spotify_to_candidate(sp, enrich=True))
+
+    return {
+        "artist":     artist,
+        "count":      len(candidates),
+        "candidates": candidates,
     }
 
 

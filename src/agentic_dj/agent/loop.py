@@ -17,7 +17,10 @@ miscalibration, arc rigidity, key tunnel vision) is built on.
 Architecture:
   - Single generic _run_react_loop driver, parametrised by tool registry
     and the name of the terminal "stop tool".
-  - run_agent_cycle uses the 12-tool catalogue and stops on add_track_to_queue.
+  - run_agent_cycle uses a Python pre-fetch step to build a scored candidate
+    shortlist, then passes it to a focused LLM loop (CYCLE_TOOLS — no search)
+    that only needs to verify harmonic fit and commit. Falls back to full
+    GROQ_TOOLS if the pre-fetch returns nothing.
   - start_session uses a focused inner toolset (search + select-opening)
     and stops on a synthetic select_opening_track tool defined inline.
   - A structured-JSON pre-step in start_session extracts the vibe vector
@@ -118,8 +121,43 @@ TOOL_DECLARATIONS: list[dict] = [
         },
     },
     {
+        "name": "search_tracks_by_tag",
+        "description": (
+            "Search for tracks by Last.fm tag — the accurate way to find music by mood or genre. "
+            "Use this for descriptive queries like 'energetic', 'chill', 'melancholic', 'dark', "
+            "'happy', 'anthemic', 'ambient', 'upbeat', 'mellow'. "
+            "Last.fm tags are crowdsourced by millions of listeners and map directly to moods/genres. "
+            "Prefer this over search_tracks for any mood or energy query."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "tag":   {"type": "string",  "description": "A Last.fm mood/genre tag e.g. 'energetic', 'chill', 'dark'"},
+                "limit": {"type": "integer", "description": "Max candidates (default 15)"},
+            },
+            "required": ["tag"],
+        },
+    },
+    {
+        "name": "search_artist_tracks",
+        "description": (
+            "Get an artist's most popular tracks, resolved to Spotify. "
+            "Use this when the listener wants tracks from a specific artist — it fetches their "
+            "top tracks from Last.fm ranked by listener count, far more reliable than a Spotify "
+            "text search which may return covers or tribute acts."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "artist": {"type": "string",  "description": "Artist name e.g. 'Radiohead'"},
+                "limit":  {"type": "integer", "description": "Max candidates (default 15)"},
+            },
+            "required": ["artist"],
+        },
+    },
+    {
         "name": "search_tracks",
-        "description": "Search Spotify for candidate tracks enriched with Last.fm tags and energy/valence estimates. Use for specific artist or track lookups mid-session.",
+        "description": "Search Spotify by text query for a specific track or artist name. Use for precise lookups like 'Creep Radiohead' or 'One More Time Daft Punk'. For mood/energy queries use search_tracks_by_tag instead; for artist catalogues use search_artist_tracks instead.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -131,7 +169,7 @@ TOOL_DECLARATIONS: list[dict] = [
     },
     {
         "name": "search_tracks_by_playlist",
-        "description": "Search for Spotify playlists matching a vibe, era, or mood description and return a sample of tracks from those playlists. Prefer this over search_tracks for descriptive queries like '2016 pop hits' or 'chill Sunday morning'. Returns raw metadata only — no BPM or key data.",
+        "description": "Search for Spotify playlists matching a vibe, era, or mood description and return a sample of tracks from those playlists. Use for era-specific queries like '2016 pop hits' or 'chill Sunday morning'. Returns raw metadata only — no BPM or key data.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -187,6 +225,22 @@ GROQ_TOOLS: list[dict] = [
     {"type": "function", "function": decl} for decl in TOOL_DECLARATIONS
 ]
 
+# Focused schema for mid-session cycles — search is done in the Python pre-step,
+# so we strip all four search tools from the tool list.
+# This prevents the LLM from burning iterations on a redundant second search
+# when a scored shortlist is already injected into the user message.
+# Falls back to full GROQ_TOOLS when the pre-step returns no candidates.
+_SEARCH_TOOL_NAMES = {
+    "search_tracks_by_tag",
+    "search_artist_tracks",
+    "search_tracks",
+    "search_tracks_by_playlist",
+}
+CYCLE_TOOLS: list[dict] = [
+    t for t in GROQ_TOOLS
+    if t["function"]["name"] not in _SEARCH_TOOL_NAMES
+]
+
 # Name → Python function lookup for tool execution
 TOOL_REGISTRY: dict[str, Any] = {
     "get_listener_state":         tool_module.get_listener_state,
@@ -195,6 +249,8 @@ TOOL_REGISTRY: dict[str, Any] = {
     "get_compatible_keys":        tool_module.get_compatible_keys,
     "check_transition":           tool_module.check_transition,
     "estimate_bpm_compatibility": tool_module.estimate_bpm_compatibility,
+    "search_tracks_by_tag":       tool_module.search_tracks_by_tag,
+    "search_artist_tracks":       tool_module.search_artist_tracks,
     "search_tracks":              tool_module.search_tracks,
     "search_tracks_by_playlist":  tool_module.search_tracks_by_playlist,
     "get_track_details":          tool_module.get_track_details,
@@ -208,37 +264,37 @@ TOOL_REGISTRY: dict[str, Any] = {
 # ══════════════════════════════════════════════════════════════════════════════
 #  SYSTEM PROMPTS
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# Tool-aware, not procedural. The prompt names the goal and the toolbox.
-# It does not script the tool order — the model decides what to call and
-# when based on the reasoning it produces.
 
 CYCLE_SYSTEM_PROMPT = """\
 You are the reasoning core of an Agentic DJ.
 
-Goal: pick the single best next track for this listener and queue it,
-then explain your choice in one or two plain sentences.
+Goal: pick the single best next track from the pre-scored candidates in the
+user message, verify its harmonic fit, and queue it. Explain your choice in
+one or two plain sentences.
 
-Toolbox:
-  • Listener state   — get_listener_state, update_listener_state, get_session_arc
-  • Playback context — get_current_playback, get_session_history, get_queue_state
-  • Search           — search_tracks, get_track_details
-  • Music theory     — get_compatible_keys, check_transition, estimate_bpm_compatibility
-  • Action           — add_track_to_queue   (terminal — call once)
+Suggested tool call order (stay within this):
+  1. get_listener_state + get_current_playback   — orient yourself (one call each)
+  2. check_transition(from_camelot, to_camelot)  — verify harmonic fit for your top candidate
+  3. get_track_details(track_name, artist)        — optional: fetch full profile if key is missing
+  4. add_track_to_queue(track_name, artist)       — TERMINAL: call once, then stop
 
-Reason about what you need, call tools to find out, decide. Ground every
-claim in actual tool output — never invent values. Do not queue a track
-already played this session. Stop as soon as one track is queued. In
-your final explanation reference at least one concrete signal (feedback
-event, arc phase, state dimension) and one musical property (key, BPM,
-energy).
+Candidates are pre-scored by energy/valence fit and listed in the user message.
+Do NOT search for more — work from the shortlist. The only exception is if every
+candidate in the list is already in the session history (already played), in
+which case you may call get_session_history to confirm and then search once.
 
-Hard rejection rule: if check_transition returns a score below 0.4
-(verdict "avoid") AND estimate_bpm_compatibility returns acceptable=False
-for the same candidate, you MUST discard that candidate and search for
-a different one. Do not call add_track_to_queue on a track that has
-failed both checks. A candidate that passes at least one of the two
-checks (harmonic OR BPM) may be accepted."""
+Commitment rule: if check_transition returns score ≥ 0.4 (verdict "acceptable"
+or "smooth"), commit that candidate immediately. Do not seek a perfect score.
+A single passing harmonic check is sufficient to act.
+
+Rejection rule: only discard a candidate if check_transition returns score < 0.4
+(verdict "avoid") AND you have a better-ranked alternative still available in
+the shortlist. Never reject without trying the next candidate.
+
+Ground every claim in actual tool output — never invent values. Do not queue
+a track already played this session. In your final explanation reference at
+least one concrete signal (arc phase or listener state dimension) and one
+musical property (key, BPM, or energy)."""
 
 
 SESSION_INTERPRET_SYSTEM = "Return only valid JSON. No prose, no markdown fences."
@@ -520,11 +576,77 @@ def _best_fallback(candidates: list[dict], state: dict) -> dict:
     return scored[0]
 
 
+def _best_fallback_top_n(candidates: list[dict], state: dict, n: int = 3) -> list[dict]:
+    """
+    Return the top N candidates ranked by energy+valence distance from the
+    current listener state. Used by the Python pre-step in run_agent_cycle
+    to build the shortlist injected into the LLM's user message.
+
+    Unlike _best_fallback (which returns a single best), this hands the LLM
+    a ranked list so it has fallback options without needing another search call.
+    """
+    if not candidates:
+        return []
+
+    target_energy  = state.get("energy",  0.5)
+    target_valence = state.get("valence", 0.5)
+
+    def score(c: dict) -> float:
+        e_diff = abs(c.get("energy_est", 0.5) - target_energy)
+        v_diff = abs(c.get("valence_est", 0.5) - target_valence)
+        return e_diff + v_diff   # lower = better fit
+
+    return sorted(candidates, key=score)[:n]
+
+
+def _state_to_tags(state: dict) -> list[str]:
+    """
+    Map the listener state vector to a ranked list of Last.fm tags.
+
+    Returns up to two tags used to drive the pre-step Last.fm search.
+    The first tag is the most specific signal; the second is a fallback
+    if the first yields too few Spotify-resolvable candidates.
+
+    Tag choices are based on which combinations perform well in Last.fm's
+    crowd-tagged index:
+      - Energy axis:   energetic / chill / indie (mid)
+      - Valence axis:  happy / melancholic / dark
+      - Arc modifier:  anthemic (peak), mellow (cooldown)
+    """
+    energy  = state.get("energy",  0.5)
+    valence = state.get("valence", 0.5)
+    arc     = state.get("arc_phase", "build")
+
+    tags: list[str] = []
+
+    # ── Arc phase takes priority at extremes ─────────────────────
+    if arc == "peak":
+        tags.append("anthemic")
+    elif arc == "cooldown":
+        tags.append("mellow")
+
+    # ── Energy dimension ──────────────────────────────────────────
+    if energy > 0.65:
+        tags.append("energetic")
+    elif energy < 0.35:
+        tags.append("chill")
+    else:
+        tags.append("indie")           # reliable mid-energy tag on Last.fm
+
+    # ── Valence dimension (only if strongly positive or negative) ─
+    if valence > 0.65 and "anthemic" not in tags:
+        tags.append("happy")
+    elif valence < 0.35 and "mellow" not in tags:
+        tags.append("melancholic")
+
+    # Return at most 2 — enough for two parallel Last.fm tag searches
+    return tags[:2] if tags else ["indie"]
+
+
 def _state_to_fallback_query(state: dict) -> str:
     """
-    Build a contextual search query from the listener state. Used when
-    the model exhausts iterations without queuing — preferable to a
-    generic 'popular music' bag.
+    Build a Spotify text search query from the listener state.
+    Used as a last resort when Last.fm tag search returns nothing resolvable.
     """
     energy  = state.get("energy",  0.5)
     valence = state.get("valence", 0.5)
@@ -559,6 +681,12 @@ def run_agent_cycle(
     get_listener_state will return the post-feedback vector when the
     model reads it. The feedback is recorded at step 0 in the trace.
 
+    A Python pre-step then searches for candidates, scores them by
+    energy/valence fit, and injects the top 3 into the user message.
+    The LLM loop is given CYCLE_TOOLS (no search tools) so it can only
+    verify harmonic fit and commit — no iteration budget wasted on search.
+    If the pre-step finds nothing, falls back to full GROQ_TOOLS.
+
     Returns:
       {
         "explanation":  str,
@@ -590,7 +718,91 @@ def run_agent_cycle(
         if verbose:
             print(f"\n[feedback] {feedback_event} on '{feedback_track}'")
 
-    # ── 2. Build initial messages ─────────────────────────────
+    # ── 2. Python pre-step: fetch, score, build shortlist ─────
+    # Candidates are gathered in Python before the LLM loop so the model
+    # receives a pre-scored shortlist and does not waste iterations on search.
+    #
+    # Strategy: use Last.fm tag search (via _state_to_tags) rather than a
+    # Spotify text query. Last.fm tags are crowdsourced mood/genre labels —
+    # searching "energetic" in Last.fm returns actually energetic tracks,
+    # whereas the same query on Spotify just matches track titles.
+    #
+    # Two tags are tried in order; results are merged and de-duplicated.
+    # Falls back to Spotify text search only if both tag searches fail.
+    state = tool_module.get_listener_state()
+    tags  = _state_to_tags(state)
+
+    if verbose:
+        print(f"\n[pre-fetch] Last.fm tags: {tags}")
+
+    raw_candidates: list[dict] = []
+    seen_ids: set[str] = set()
+
+    for tag in tags:
+        if len(raw_candidates) >= 15:
+            break
+        result = tool_module.search_tracks_by_tag(tag, limit=10)
+        for c in result.get("candidates", []):
+            cid = c.get("id")
+            if cid and cid not in seen_ids:
+                seen_ids.add(cid)
+                raw_candidates.append(c)
+        if verbose:
+            print(f"[pre-fetch] tag '{tag}' → {len(result.get('candidates', []))} candidates")
+    # Fallback to Spotify text search if Last.fm tag search resolved nothing
+    if not raw_candidates:
+        query      = _state_to_fallback_query(state)
+        pre_search = tool_module.search_tracks(query, limit=10)
+        raw_candidates = pre_search.get("candidates", [])
+        if verbose:
+            print(f"[pre-fetch] Last.fm empty — Spotify fallback query: '{query}'")
+
+    shortlist = _best_fallback_top_n(raw_candidates, state, n=3)
+
+    trace.append(_trace_entry(
+        step       = 0,
+        kind       = "act",
+        content    = f"Pre-fetch: tags={tags} → {len(raw_candidates)} candidates → shortlist of {len(shortlist)}",
+        tool_name  = "search_tracks_by_tag",
+        tool_args  = {"tags": tags},
+        tool_result= {"count": len(raw_candidates), "shortlist_size": len(shortlist)},
+    ))
+
+    if DISPLAY_LOGS and shortlist:
+        print(f"[pre-fetch] shortlist ({len(shortlist)}):")
+        for c in shortlist:
+            key_s = c.get("camelot_position") or "?"
+            bpm_s = f"BPM={c['bpm']}" if c.get("bpm") else "BPM=?"
+            print(f"  • {c['name']} — {c['artist']}  key={key_s}  {bpm_s}"
+                  f"  E={c.get('energy_est', 0.5):.2f}  V={c.get('valence_est', 0.5):.2f}")
+
+    # Build the candidate section injected into the user message
+    if shortlist:
+        lines = []
+        for i, c in enumerate(shortlist, 1):
+            key_s  = c.get("camelot_position") or "?"
+            bpm_s  = f"BPM={c['bpm']}" if c.get("bpm") else "BPM=unknown"
+            tags_s = ", ".join(c.get("tags", [])[:3]) or "—"
+            lines.append(
+                f"  {i}. \"{c['name']}\" by {c['artist']}"
+                f"  —  key={key_s}  {bpm_s}"
+                f"  energy={c.get('energy_est', 0.5):.2f}"
+                f"  valence={c.get('valence_est', 0.5):.2f}"
+                f"  tags=[{tags_s}]"
+            )
+        candidate_section = (
+            f"\n\nPre-scored candidates from Last.fm tag search {tags}"
+            " (ranked best-first by energy/valence fit):\n"
+            + "\n".join(lines)
+            + "\n\nVerify harmonic fit of candidate #1, then commit with add_track_to_queue."
+        )
+        tools_for_cycle = CYCLE_TOOLS   # search already done — no need for LLM to search
+    else:
+        # No pre-fetched candidates — give the LLM full tools so it can search
+        candidate_section = ""
+        tools_for_cycle   = GROQ_TOOLS
+
+    # ── 3. Build initial messages ─────────────────────────────
     context_note = (
         f" The listener just triggered a '{feedback_event}' on the current track —"
         " factor that into your reasoning."
@@ -598,25 +810,26 @@ def run_agent_cycle(
     )
     messages: list[dict] = [
         {"role": "system", "content": CYCLE_SYSTEM_PROMPT},
-        {"role": "user",   "content": f"Select and queue the next track.{context_note}"},
+        {"role": "user",   "content": (
+            f"Select and queue the next track.{context_note}{candidate_section}"
+        )},
     ]
 
     if verbose:
         print("\n[react] starting cycle…")
 
-    # ── 3. Run the ReAct loop ─────────────────────────────────
-    result = _run_react_loop(messages, trace=trace)
+    # ── 4. Run the ReAct loop ─────────────────────────────────
+    result = _run_react_loop(messages, trace=trace, tools_schema=tools_for_cycle)
 
-    # ── 4. Fallback if no track queued ────────────────────────
+    # ── 5. Fallback if no track queued ────────────────────────
     if not result.get("queued"):
         if verbose or DISPLAY_LOGS:
             print("[fallback] loop did not queue — using scored fallback")
-        state      = tool_module.get_listener_state()
-        query      = _state_to_fallback_query(state)
-        candidates = tool_module.search_tracks(query, limit=8).get("candidates", [])
+        # Reuse the pre-fetched candidates; only re-search if there were none
+        candidates = raw_candidates or tool_module.search_tracks(query, limit=8).get("candidates", [])
         best       = _best_fallback(candidates, state)
         if best:
-            queue_result    = tool_module.add_track_to_queue(best["name"], best["artist"])
+            queue_result     = tool_module.add_track_to_queue(best["name"], best["artist"])
             result["queued"] = queue_result
             if not result.get("explanation"):
                 result["explanation"] = (
@@ -624,7 +837,7 @@ def run_agent_cycle(
                     f"match to the current state when the agent could not converge."
                 )
 
-    # ── 5. Normalise return shape ─────────────────────────────
+    # ── 6. Normalise return shape ─────────────────────────────
     queued      = result.get("queued") or {}
     explanation = result.get("explanation", "")
 
@@ -847,10 +1060,11 @@ def _react_pick_opener(
     Focused ReAct sub-loop that asks the model to pick an opening track.
 
     Uses a 3-tool inner toolset:
-      - search_tracks       (real tool from tool_module)
-      - get_track_details   (real tool from tool_module)
-      - select_opening_track (synthetic terminal — defined inline here so
-                              the public 12-tool catalogue stays untouched)
+      - search_tracks_by_playlist (real tool from tool_module)
+      - search_tracks             (real tool from tool_module)
+      - get_track_details         (real tool from tool_module)
+      - select_opening_track      (synthetic terminal — defined inline here so
+                                   the public 12-tool catalogue stays untouched)
 
     Returns the chosen {name, artist} dict, or None if the model fails
     to commit within the iteration budget.

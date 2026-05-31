@@ -204,6 +204,86 @@ def get_similar_artists(artist: str, limit: int = 5, use_cache: bool = True) -> 
     return names
 
 
+def get_top_tracks_for_tag(
+    tag:       str,
+    limit:     int  = 30,
+    use_cache: bool = True,
+) -> list[dict]:
+    """
+    Return the top Last.fm tracks for a given tag (e.g. 'energetic', 'chill',
+    'melancholic', 'dark', 'happy').
+
+    This is the right search primitive for mood/energy queries — Last.fm's
+    tag index is crowdsourced and accurate, unlike Spotify text search which
+    just matches the tag string against track titles.
+
+    Returns a list of {"name": ..., "artist": ...} dicts.
+    Cached to disk like all other Last.fm calls.
+    """
+    key = _cache_key(f"tag:{tag.lower().strip()}", "_top_tracks")
+
+    if use_cache:
+        cached = _read_cache(key)
+        if cached is not None:
+            return cached.get("tracks", [])
+
+    network = _get_network()
+    try:
+        items  = network.get_tag(tag).get_top_tracks(limit=limit)
+        tracks = [
+            {"name": t.item.title, "artist": t.item.artist.name}
+            for t in items
+            if getattr(t, "item", None)
+            and getattr(t.item, "title", None)
+            and getattr(t.item, "artist", None)
+        ]
+    except pylast.WSError:
+        tracks = []
+
+    if use_cache:
+        _write_cache(key, {"tracks": tracks})
+
+    return tracks
+
+
+def get_artist_top_tracks_lastfm(
+    artist:    str,
+    limit:     int  = 30,
+    use_cache: bool = True,
+) -> list[dict]:
+    """
+    Return an artist's top tracks from Last.fm.
+
+    Preferable to Spotify artist search when the caller already knows the
+    artist name and wants their most-listened-to songs rather than search
+    results that might include other artists with similar names.
+
+    Returns a list of {"name": ..., "artist": ...} dicts.
+    """
+    key = _cache_key(f"artist:{artist.lower().strip()}", "_top_tracks")
+
+    if use_cache:
+        cached = _read_cache(key)
+        if cached is not None:
+            return cached.get("tracks", [])
+
+    network = _get_network()
+    try:
+        items  = network.get_artist(artist).get_top_tracks(limit=limit)
+        tracks = [
+            {"name": t.item.title, "artist": t.item.artist.name}
+            for t in items
+            if getattr(t, "item", None) and getattr(t.item, "title", None)
+        ]
+    except pylast.WSError:
+        tracks = []
+
+    if use_cache:
+        _write_cache(key, {"tracks": tracks})
+
+    return tracks
+
+
 def clear_cache() -> int:
     """Delete all cached Last.fm responses. Returns the number of files removed."""
     if not _cache_dir.exists():
