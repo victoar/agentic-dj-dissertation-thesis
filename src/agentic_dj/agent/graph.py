@@ -1,27 +1,25 @@
 """
-LangGraph agent graph for AgDJ (migration scaffold — Phase 1).
+LangGraph agent graph for AgDJ (migration).
 
-This module defines the compiled ReAct graph that will replace the hand-rolled
-``_run_react_loop`` in ``loop.py``. It is built and unit-tested in isolation in
-Phase 1; ``loop.py`` is not rewired to call it until Phases 2–3.
+Compiled ReAct graphs that replace the hand-rolled ``_run_react_loop`` in
+``loop.py``. Two builders share the same agent/explain nodes and routers:
 
-Control flow (mirrors the current loop exactly):
+  • build_dj_graph     — mid-session cycle. Stops on add_track_to_queue.
+  • build_opener_graph — natural-language session start. Stops on
+                         select_opening_track, with an anti-hallucination guard:
+                         the model may only commit a track it has actually seen
+                         in a prior search result. The ``seen_tracks`` set lives
+                         in DJState (not a closure) so it is inspectable/testable.
+
+Control flow (mirrors the original loop):
 
     START → agent
     agent → tool_calls?  yes → tools      no → END   (final text = explanation)
     tools → stop tool fired?  yes → explain → END     no → agent
 
-Nodes:
-  • agent   — ChatGroq(.bind_tools).invoke; records a `think` trace entry from
-              the model's reasoning (read from additional_kwargs["reasoning_content"],
-              NOT .content — gpt-oss puts reasoning on a separate channel).
-  • tools   — custom node: executes the LangChain tools, records one `act` entry
-              per call, and flags the terminal/stop tool's success.
-  • explain — one tool-less LLM turn to get the plain-language explanation
-              (mirrors the old `tools=None` final call).
-
-Backoff is delegated to ChatGroq(max_retries=4) (plan §6.4) — there is no
-custom _groq_call here.
+Reasoning is read from additional_kwargs["reasoning_content"] (gpt-oss puts it
+on a separate channel; .content is empty on tool-call turns). Backoff is
+delegated to ChatGroq(max_retries=4) — there is no custom _groq_call here.
 """
 
 import json
@@ -52,10 +50,11 @@ class DJState(TypedDict, total=False):
     step:        int                 # trace step counter
     terminal:    Optional[dict]      # result dict of the stop tool, once it succeeds
     explanation: str
-    seen_tracks: dict                # anti-hallucination set for the opener graph (Phase 3)
+    seen_tracks: dict                # opener anti-hallucination set: "name|artist" -> {name, artist}
+    choice:      Optional[dict]      # opener: the committed {name, artist}
 
 
-# ── Trace helper (same shape as loop._trace_entry) ──────────────────────────────
+# ── Trace helper (same shape as the original loop._trace_entry) ─────────────────
 
 def _trace_entry(
     step:        int,
@@ -94,29 +93,9 @@ def _message_text(message: Any) -> str:
     return content.strip() if isinstance(content, str) else ""
 
 
-# ── Graph factory ───────────────────────────────────────────────────────────────
+# ── Shared nodes & routers ──────────────────────────────────────────────────────
 
-def build_dj_graph(
-    tools:          list,
-    stop_tool:      str,
-    model:          str = MODEL,
-    temperature:    float = 0.3,
-    max_retries:    int = 4,
-):
-    """
-    Build and compile a ReAct graph over ``tools``, terminating when
-    ``stop_tool`` returns a dict with ``success`` True.
-
-    Returns the compiled graph. The caller invokes it with an initial DJState
-    and a config carrying ``recursion_limit`` (see ``run_graph``). The same
-    factory builds the mid-session cycle graph (tools=CYCLE_TOOLS,
-    stop_tool="add_track_to_queue") and the opener graph (Phase 3).
-    """
-    llm = ChatGroq(model=model, temperature=temperature, max_retries=max_retries)
-    llm_with_tools = llm.bind_tools(tools)
-    registry = {t.name: t for t in tools}
-
-    # ── agent node ──────────────────────────────────────────────
+def _make_agent_node(llm_with_tools):
     def agent_node(state: DJState) -> dict:
         response = llm_with_tools.invoke(state["messages"])
         trace = list(state.get("trace", []))
@@ -139,8 +118,50 @@ def build_dj_graph(
                 update["step"]  = step
             update["explanation"] = explanation
         return update
+    return agent_node
 
-    # ── tools node ──────────────────────────────────────────────
+
+def _make_explain_node(llm):
+    def explain_node(state: DJState) -> dict:
+        trace = list(state.get("trace", []))
+        step  = state.get("step", 1)
+        try:
+            response = llm.invoke(state["messages"])        # no tools bound
+            explanation = _message_text(response) or _extract_reasoning(response)
+        except Exception:                                    # noqa: BLE001
+            explanation = ""                                 # caller synthesises a fallback
+        if explanation:
+            trace.append(_trace_entry(step, "explain", explanation))
+            step += 1
+        return {"trace": trace, "step": step, "explanation": explanation}
+    return explain_node
+
+
+def _route_after_agent(state: DJState) -> str:
+    last = state["messages"][-1]
+    return "tools" if getattr(last, "tool_calls", None) else END
+
+
+def _route_after_tools(state: DJState) -> str:
+    return "explain" if state.get("terminal") else "agent"
+
+
+def _assemble(llm, llm_with_tools, tools_node):
+    """Wire the shared agent/explain nodes + routers around a given tools node."""
+    g = StateGraph(DJState)
+    g.add_node("agent", _make_agent_node(llm_with_tools))
+    g.add_node("tools", tools_node)
+    g.add_node("explain", _make_explain_node(llm))
+    g.add_edge(START, "agent")
+    g.add_conditional_edges("agent", _route_after_agent, {"tools": "tools", END: END})
+    g.add_conditional_edges("tools", _route_after_tools, {"explain": "explain", "agent": "agent"})
+    g.add_edge("explain", END)
+    return g.compile()
+
+
+# ── Standard tools node (mid-session cycle) ─────────────────────────────────────
+
+def _make_standard_tools_node(registry: dict, stop_tool: str):
     def tools_node(state: DJState) -> dict:
         last  = state["messages"][-1]
         trace = list(state.get("trace", []))
@@ -161,69 +182,156 @@ def build_dj_graph(
                     result = {"error": f"Tool '{name}' raised: {exc}"}
 
             trace.append(_trace_entry(
-                step       = step,
-                kind       = "act",
-                content    = name,
-                tool_name  = name,
-                tool_args  = args,
-                tool_result= result if isinstance(result, dict) else {"value": result},
+                step=step, kind="act", content=name,
+                tool_name=name, tool_args=args,
+                tool_result=result if isinstance(result, dict) else {"value": result},
             ))
             step += 1
+            out_messages.append(ToolMessage(content=json.dumps(result, default=str),
+                                            tool_call_id=tc["id"]))
 
-            out_messages.append(ToolMessage(
-                content=json.dumps(result, default=str),
-                tool_call_id=tc["id"],
-            ))
-
-            if (
-                name == stop_tool
-                and isinstance(result, dict)
-                and result.get("success")
-            ):
+            if name == stop_tool and isinstance(result, dict) and result.get("success"):
                 terminal = result
 
-        return {
-            "messages": out_messages,
-            "trace":    trace,
-            "step":     step,
-            "terminal": terminal,
-        }
+        return {"messages": out_messages, "trace": trace, "step": step, "terminal": terminal}
+    return tools_node
 
-    # ── explain node (tool-less final turn) ─────────────────────
-    def explain_node(state: DJState) -> dict:
+
+# ── Opener tools node (natural-language session start) ──────────────────────────
+
+def _register_candidates(seen: dict, candidates: list) -> None:
+    for c in candidates:
+        name = c.get("name", "")
+        if not name:
+            continue
+        key = f"{name.lower()}|{c.get('artist', '').lower()}"
+        seen[key] = {"name": name, "artist": c.get("artist", "")}
+
+
+def _validate_opening_choice(track_name: str, artist: str, seen: dict):
+    """
+    Port of the original select_opening_track guard. Returns (result_dict, picked
+    or None). A track may only be committed if it was seen in a prior search.
+    """
+    key = f"{track_name.lower()}|{artist.lower()}"
+    if key in seen:
+        picked = {"name": track_name, "artist": artist}
+        return {"success": True, "selected": picked}, picked
+
+    # Partial name match (handles minor title punctuation differences)
+    name_lower = track_name.lower()
+    for k, v in seen.items():
+        if k.split("|")[0] == name_lower:
+            picked = {"name": v["name"], "artist": v["artist"]}
+            return {"success": True, "selected": picked}, picked
+
+    available = ", ".join(
+        f"'{v['name']}' by {v['artist']}" for v in list(seen.values())[:6]
+    ) or "none yet — call search_tracks_by_playlist first"
+    return {
+        "success": False,
+        "error": (
+            f"'{track_name}' by {artist} was not in your search results and cannot "
+            f"be committed. You must select a track you have actually seen returned "
+            f"by a search tool this session. Available candidates include: {available}."
+        ),
+    }, None
+
+
+def _make_opener_tools_node(registry: dict, stop_tool: str):
+    def tools_node(state: DJState) -> dict:
+        last  = state["messages"][-1]
         trace = list(state.get("trace", []))
         step  = state.get("step", 1)
-        try:
-            response = llm.invoke(state["messages"])        # no tools bound
-            explanation = _message_text(response) or _extract_reasoning(response)
-        except Exception:                                    # noqa: BLE001
-            explanation = ""                                 # caller synthesises a fallback
-        if explanation:
-            trace.append(_trace_entry(step, "explain", explanation))
+        terminal = state.get("terminal")
+        choice   = state.get("choice")
+        seen     = dict(state.get("seen_tracks", {}))
+        out_messages = []
+
+        for tc in last.tool_calls:
+            name = tc["name"]
+            args = tc.get("args", {}) or {}
+
+            if name == stop_tool:
+                # Validated against graph state — the tool body is never run.
+                result, picked = _validate_opening_choice(
+                    args.get("track_name", ""), args.get("artist", ""), seen
+                )
+                if result.get("success"):
+                    terminal = result
+                    choice   = picked
+            else:
+                tool = registry.get(name)
+                if tool is None:
+                    result = {"error": f"Unknown tool: {name}"}
+                else:
+                    try:
+                        result = tool.invoke(args)
+                    except Exception as exc:                   # noqa: BLE001
+                        result = {"error": f"Tool '{name}' raised: {exc}"}
+                # Register everything the model has now seen.
+                if isinstance(result, dict):
+                    if isinstance(result.get("candidates"), list):
+                        _register_candidates(seen, result["candidates"])
+                    elif result.get("name") and not result.get("error"):
+                        _register_candidates(seen, [result])
+
+            trace.append(_trace_entry(
+                step=step, kind="act", content=name,
+                tool_name=name, tool_args=args,
+                tool_result=result if isinstance(result, dict) else {"value": result},
+            ))
             step += 1
-        return {"trace": trace, "step": step, "explanation": explanation}
+            out_messages.append(ToolMessage(content=json.dumps(result, default=str),
+                                            tool_call_id=tc["id"]))
 
-    # ── routers ─────────────────────────────────────────────────
-    def route_after_agent(state: DJState) -> str:
-        last = state["messages"][-1]
-        return "tools" if getattr(last, "tool_calls", None) else END
-
-    def route_after_tools(state: DJState) -> str:
-        return "explain" if state.get("terminal") else "agent"
-
-    # ── assemble ────────────────────────────────────────────────
-    g = StateGraph(DJState)
-    g.add_node("agent", agent_node)
-    g.add_node("tools", tools_node)
-    g.add_node("explain", explain_node)
-    g.add_edge(START, "agent")
-    g.add_conditional_edges("agent", route_after_agent, {"tools": "tools", END: END})
-    g.add_conditional_edges("tools", route_after_tools, {"explain": "explain", "agent": "agent"})
-    g.add_edge("explain", END)
-    return g.compile()
+        return {
+            "messages": out_messages, "trace": trace, "step": step,
+            "terminal": terminal, "choice": choice, "seen_tracks": seen,
+        }
+    return tools_node
 
 
-# ── Convenience runner (used by loop.py in Phase 2) ─────────────────────────────
+# ── Graph factories ─────────────────────────────────────────────────────────────
+
+def _make_llm(model: str, temperature: float, max_retries: int):
+    return ChatGroq(model=model, temperature=temperature, max_retries=max_retries)
+
+
+def build_dj_graph(
+    tools:       list,
+    stop_tool:   str,
+    model:       str = MODEL,
+    temperature: float = 0.3,
+    max_retries: int = 4,
+):
+    """Compile the mid-session cycle graph (stops on ``stop_tool`` success)."""
+    llm = _make_llm(model, temperature, max_retries)
+    registry = {t.name: t for t in tools}
+    return _assemble(llm, llm.bind_tools(tools),
+                     _make_standard_tools_node(registry, stop_tool))
+
+
+def build_opener_graph(
+    tools:       list,
+    stop_tool:   str = "select_opening_track",
+    model:       str = MODEL,
+    temperature: float = 0.3,
+    max_retries: int = 4,
+):
+    """
+    Compile the natural-language session-start graph. ``tools`` should be the
+    opener toolset (search tools + the synthetic stop tool object). The stop
+    tool's body is never executed — the opener tools node validates the choice
+    against ``seen_tracks`` in graph state.
+    """
+    llm = _make_llm(model, temperature, max_retries)
+    registry = {t.name: t for t in tools}
+    return _assemble(llm, llm.bind_tools(tools),
+                     _make_opener_tools_node(registry, stop_tool))
+
+
+# ── Convenience runner (used by loop.py) ────────────────────────────────────────
 
 def run_graph(
     graph,
@@ -232,10 +340,10 @@ def run_graph(
     max_iterations:  int = MAX_ITERATIONS,
 ) -> dict:
     """
-    Invoke a compiled DJ graph and normalise the final state into the shape the
-    public loop functions expect: {"queued": <terminal|None>, "explanation": str,
-    "trace": list}. ``recursion_limit`` is derived from max_iterations (each ReAct
-    turn is agent+tools = 2 graph steps, plus a margin for the explain node).
+    Invoke a compiled graph and normalise the final state into the shape the
+    public loop functions expect: {"queued", "explanation", "trace", "choice"}.
+    ``recursion_limit`` is derived from max_iterations (agent+tools = 2 steps per
+    ReAct turn, plus margin for the explain node).
     """
     initial: DJState = {
         "messages":    messages,
@@ -244,10 +352,12 @@ def run_graph(
         "terminal":    None,
         "explanation": "",
         "seen_tracks": seen_tracks if seen_tracks is not None else {},
+        "choice":      None,
     }
     final = graph.invoke(initial, config={"recursion_limit": max_iterations * 2 + 2})
     return {
         "queued":      final.get("terminal"),
         "explanation": final.get("explanation", ""),
         "trace":       final.get("trace", []),
+        "choice":      final.get("choice"),
     }

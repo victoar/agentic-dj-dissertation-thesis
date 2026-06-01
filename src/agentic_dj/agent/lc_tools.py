@@ -198,3 +198,26 @@ CYCLE_TOOLS = [t for t in ALL_TOOLS if t.name not in _SEARCH_TOOL_NAMES]
 
 #: name -> tool object, for execution inside the custom tools node.
 TOOLS_BY_NAME = {t.name: t for t in ALL_TOOLS}
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  OPENER TOOLSET  (natural-language session start — start_session)
+# ════════════════════════════════════════════════════════════════════════════
+# Kept separate from ALL_TOOLS. The opener exposes only the three search tools
+# plus a synthetic terminal. select_opening_track's body is never executed —
+# the opener graph node validates the choice against seen_tracks in graph state.
+
+@tool
+def select_opening_track(track_name: str, artist: str) -> dict:
+    """Terminal action: commit the chosen opening track. The track MUST have been returned by search_tracks_by_playlist, search_tracks, or get_track_details earlier in this session — any other name will be rejected with an error."""
+    # Handled by the opener graph's tools node (validates against graph state).
+    return {"success": False, "error": "select_opening_track must be handled by the opener graph node"}
+
+
+#: Tools the natural-language session-start agent can call.
+OPENER_TOOLS = [
+    search_tracks_by_playlist,
+    search_tracks,
+    get_track_details,
+    select_opening_track,
+]

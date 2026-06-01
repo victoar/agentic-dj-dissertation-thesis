@@ -36,8 +36,11 @@ from typing import Any
 
 from groq import Groq
 from dotenv import load_dotenv
+from langchain_core.messages import SystemMessage, HumanMessage
 
 from agentic_dj.agent import tools as tool_module
+from agentic_dj.agent import lc_tools
+from agentic_dj.agent.graph import build_dj_graph, build_opener_graph, run_graph
 from agentic_dj.agent.state import init_state_from_values
 from agentic_dj.music.tags import prewarm_embedding_model
 
@@ -665,6 +668,39 @@ def _state_to_fallback_query(state: dict) -> str:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  COMPILED CYCLE GRAPHS  (lazy singletons — built once, reused every cycle)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Two variants, both terminating on add_track_to_queue:
+#   • cycle  — CYCLE_TOOLS (no search; the Python pre-step already searched)
+#   • full   — ALL_TOOLS  (used only when the pre-step found no candidates)
+
+_CYCLE_GRAPH  = None
+_FULL_GRAPH   = None
+_OPENER_GRAPH = None
+
+
+def _get_cycle_graph(full: bool):
+    """Return the compiled cycle graph, building it on first use."""
+    global _CYCLE_GRAPH, _FULL_GRAPH
+    if full:
+        if _FULL_GRAPH is None:
+            _FULL_GRAPH = build_dj_graph(lc_tools.ALL_TOOLS, stop_tool="add_track_to_queue")
+        return _FULL_GRAPH
+    if _CYCLE_GRAPH is None:
+        _CYCLE_GRAPH = build_dj_graph(lc_tools.CYCLE_TOOLS, stop_tool="add_track_to_queue")
+    return _CYCLE_GRAPH
+
+
+def _get_opener_graph():
+    """Return the compiled natural-language opener graph, building it on first use."""
+    global _OPENER_GRAPH
+    if _OPENER_GRAPH is None:
+        _OPENER_GRAPH = build_opener_graph(lc_tools.OPENER_TOOLS, stop_tool="select_opening_track")
+    return _OPENER_GRAPH
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  PUBLIC API — run_agent_cycle
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -796,11 +832,11 @@ def run_agent_cycle(
             + "\n".join(lines)
             + "\n\nVerify harmonic fit of candidate #1, then commit with add_track_to_queue."
         )
-        tools_for_cycle = CYCLE_TOOLS   # search already done — no need for LLM to search
+        use_full_tools = False   # search already done — no need for LLM to search
     else:
         # No pre-fetched candidates — give the LLM full tools so it can search
         candidate_section = ""
-        tools_for_cycle   = GROQ_TOOLS
+        use_full_tools    = True
 
     # ── 3. Build initial messages ─────────────────────────────
     context_note = (
@@ -808,18 +844,26 @@ def run_agent_cycle(
         " factor that into your reasoning."
         if feedback_event else ""
     )
-    messages: list[dict] = [
-        {"role": "system", "content": CYCLE_SYSTEM_PROMPT},
-        {"role": "user",   "content": (
+    messages = [
+        SystemMessage(content=CYCLE_SYSTEM_PROMPT),
+        HumanMessage(content=(
             f"Select and queue the next track.{context_note}{candidate_section}"
-        )},
+        )),
     ]
 
     if verbose:
         print("\n[react] starting cycle…")
 
-    # ── 4. Run the ReAct loop ─────────────────────────────────
-    result = _run_react_loop(messages, trace=trace, tools_schema=tools_for_cycle)
+    # ── 4. Run the ReAct loop (LangGraph) ─────────────────────
+    # The graph builds its own trace starting at step 1; we extend the trace
+    # already holding the step-0 feedback + pre-fetch entries.
+    graph     = _get_cycle_graph(full=use_full_tools)
+    graph_out = run_graph(graph, messages, max_iterations=MAX_ITERATIONS)
+    trace.extend(graph_out["trace"])
+    result = {
+        "queued":      graph_out["queued"],
+        "explanation": graph_out["explanation"],
+    }
 
     # ── 5. Fallback if no track queued ────────────────────────
     if not result.get("queued"):
@@ -1059,144 +1103,15 @@ def _react_pick_opener(
     """
     Focused ReAct sub-loop that asks the model to pick an opening track.
 
-    Uses a 3-tool inner toolset:
-      - search_tracks_by_playlist (real tool from tool_module)
-      - search_tracks             (real tool from tool_module)
-      - get_track_details         (real tool from tool_module)
-      - select_opening_track      (synthetic terminal — defined inline here so
-                                   the public 12-tool catalogue stays untouched)
+    Uses the opener graph (lc_tools.OPENER_TOOLS):
+      - search_tracks_by_playlist, search_tracks, get_track_details (real tools)
+      - select_opening_track (synthetic terminal; the model may only commit a
+        track it has actually seen in a prior search result — the guard lives in
+        the opener graph node, validating against seen_tracks in DJState).
 
     Returns the chosen {name, artist} dict, or None if the model fails
     to commit within the iteration budget.
     """
-    choice: dict[str, Any] = {}
-
-    # Tracks every candidate the agent has actually seen this sub-loop.
-    # Keys are lowercase "name|artist" strings. select_opening_track
-    # validates against this set so the model cannot commit a track it
-    # never searched for.
-    seen_tracks: dict[str, dict] = {}   # "name|artist" → {name, artist}
-
-    def _register_candidates(candidates: list[dict]) -> None:
-        for c in candidates:
-            key = f"{c.get('name', '').lower()}|{c.get('artist', '').lower()}"
-            if key:
-                seen_tracks[key] = {"name": c["name"], "artist": c.get("artist", "")}
-
-    def _search_tracks_by_playlist_tracked(query: str, sample_size: int = 20) -> dict:
-        result = tool_module.search_tracks_by_playlist(query, sample_size)
-        _register_candidates(result.get("candidates", []))
-        return result
-
-    def _search_tracks_tracked(query: str, limit: int = 8) -> dict:
-        result = tool_module.search_tracks(query, limit)
-        _register_candidates(result.get("candidates", []))
-        return result
-
-    def _get_track_details_tracked(track_name: str, artist: str) -> dict:
-        result = tool_module.get_track_details(track_name, artist)
-        # get_track_details returns a flat candidate dict, not a list
-        if result.get("name") and not result.get("error"):
-            _register_candidates([result])
-        return result
-
-    def select_opening_track(track_name: str, artist: str) -> dict:
-        """
-        Synthetic terminal tool — commits the opening track.
-        Rejects any track not seen in a prior search result this session,
-        forcing the model to pick from actual candidates rather than
-        falling back to its training knowledge.
-        """
-        key = f"{track_name.lower()}|{artist.lower()}"
-
-        # Exact match
-        if key in seen_tracks:
-            choice["name"]   = track_name
-            choice["artist"] = artist
-            return {"success": True, "selected": {"name": track_name, "artist": artist}}
-
-        # Partial name match (handles minor title punctuation differences)
-        name_lower = track_name.lower()
-        for k, v in seen_tracks.items():
-            if k.split("|")[0] == name_lower:
-                choice["name"]   = v["name"]
-                choice["artist"] = v["artist"]
-                return {"success": True, "selected": choice.copy()}
-
-        # Track was not in search results — reject and list what IS available
-        available = ", ".join(
-            f"'{v['name']}' by {v['artist']}"
-            for v in list(seen_tracks.values())[:6]
-        ) or "none yet — call search_tracks_by_playlist first"
-
-        return {
-            "success": False,
-            "error": (
-                f"'{track_name}' by {artist} was not in your search results "
-                f"and cannot be committed. You must select a track you have "
-                f"actually seen returned by a search tool this session. "
-                f"Available candidates include: {available}."
-            ),
-        }
-
-    inner_registry: dict[str, Any] = {
-        "search_tracks_by_playlist": _search_tracks_by_playlist_tracked,
-        "search_tracks":             _search_tracks_tracked,
-        "get_track_details":         _get_track_details_tracked,
-        "select_opening_track":      select_opening_track,
-    }
-
-    inner_tools_schema: list[dict] = [
-        {"type": "function", "function": {
-            "name":        "search_tracks_by_playlist",
-            "description": "Search for Spotify playlists matching a vibe, era, or mood description and return a sample of tracks. Preferred for descriptive queries like '2016 pop hits'. Returns raw metadata only — no BPM or key.",
-            "parameters":  {
-                "type": "object",
-                "properties": {
-                    "query":       {"type": "string"},
-                    "sample_size": {"type": "integer"},
-                },
-                "required": ["query"],
-            },
-        }},
-        {"type": "function", "function": {
-            "name":        "search_tracks",
-            "description": "Search Spotify for candidate tracks. Use only for specific artist or track lookups, not for vibe/era descriptions.",
-            "parameters":  {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "limit": {"type": "integer"},
-                },
-                "required": ["query"],
-            },
-        }},
-        {"type": "function", "function": {
-            "name":        "get_track_details",
-            "description": "Get full details for a specific track — metadata, tags, energy, valence, BPM, key.",
-            "parameters":  {
-                "type": "object",
-                "properties": {
-                    "track_name": {"type": "string"},
-                    "artist":     {"type": "string"},
-                },
-                "required": ["track_name", "artist"],
-            },
-        }},
-        {"type": "function", "function": {
-            "name":        "select_opening_track",
-            "description": "Terminal action: commit the chosen opening track. The track MUST have been returned by search_tracks_by_playlist, search_tracks, or get_track_details earlier in this session — any other name will be rejected with an error.",
-            "parameters":  {
-                "type": "object",
-                "properties": {
-                    "track_name": {"type": "string"},
-                    "artist":     {"type": "string"},
-                },
-                "required": ["track_name", "artist"],
-            },
-        }},
-    ]
-
     queries_text = "\n".join(f"  • {q}" for q in search_queries[:3])
     user_msg = (
         f"Session vibe: {label}\n"
@@ -1208,24 +1123,19 @@ def _react_pick_opener(
         f"Pick and commit the opening track."
     )
 
-    messages: list[dict] = [
-        {"role": "system", "content": SESSION_PICK_SYSTEM},
-        {"role": "user",   "content": user_msg},
+    messages = [
+        SystemMessage(content=SESSION_PICK_SYSTEM),
+        HumanMessage(content=user_msg),
     ]
 
     if verbose:
         print("\n[start_session/react] picking opener…")
 
-    result = _run_react_loop(
-        messages       = messages,
-        trace          = trace,
-        max_iterations = 8,
-        registry       = inner_registry,
-        tools_schema   = inner_tools_schema,
-        stop_tool      = "select_opening_track",
-        log_prefix     = "open ",
-    )
+    graph     = _get_opener_graph()
+    graph_out = run_graph(graph, messages, max_iterations=8)
+    trace.extend(graph_out["trace"])
 
-    if result.get("queued") and choice.get("name") and choice.get("artist"):
+    choice = graph_out.get("choice")
+    if graph_out.get("queued") and choice and choice.get("name") and choice.get("artist"):
         return {"name": choice["name"], "artist": choice["artist"]}
     return None
