@@ -1,0 +1,253 @@
+"""
+LangGraph agent graph for AgDJ (migration scaffold — Phase 1).
+
+This module defines the compiled ReAct graph that will replace the hand-rolled
+``_run_react_loop`` in ``loop.py``. It is built and unit-tested in isolation in
+Phase 1; ``loop.py`` is not rewired to call it until Phases 2–3.
+
+Control flow (mirrors the current loop exactly):
+
+    START → agent
+    agent → tool_calls?  yes → tools      no → END   (final text = explanation)
+    tools → stop tool fired?  yes → explain → END     no → agent
+
+Nodes:
+  • agent   — ChatGroq(.bind_tools).invoke; records a `think` trace entry from
+              the model's reasoning (read from additional_kwargs["reasoning_content"],
+              NOT .content — gpt-oss puts reasoning on a separate channel).
+  • tools   — custom node: executes the LangChain tools, records one `act` entry
+              per call, and flags the terminal/stop tool's success.
+  • explain — one tool-less LLM turn to get the plain-language explanation
+              (mirrors the old `tools=None` final call).
+
+Backoff is delegated to ChatGroq(max_retries=4) (plan §6.4) — there is no
+custom _groq_call here.
+"""
+
+import json
+from typing import Annotated, Any, Optional, TypedDict
+
+from langchain_core.messages import ToolMessage
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langchain_groq import ChatGroq
+
+
+# Defined locally so importing this module does not import loop.py (which
+# instantiates a Groq client at import time and needs GROQ_API_KEY).
+MODEL: str = "openai/gpt-oss-120b"
+MAX_ITERATIONS: int = 15
+
+
+# ── Graph state ───────────────────────────────────────────────────────────────
+
+class DJState(TypedDict, total=False):
+    """State carried through the graph.
+
+    ``messages`` uses the add_messages reducer (append semantics). All other
+    keys are plain — a node returns the new value and LangGraph overwrites.
+    """
+    messages:    Annotated[list, add_messages]
+    trace:       list[dict]          # _trace_entry-compatible dicts
+    step:        int                 # trace step counter
+    terminal:    Optional[dict]      # result dict of the stop tool, once it succeeds
+    explanation: str
+    seen_tracks: dict                # anti-hallucination set for the opener graph (Phase 3)
+
+
+# ── Trace helper (same shape as loop._trace_entry) ──────────────────────────────
+
+def _trace_entry(
+    step:        int,
+    kind:        str,                 # "think" | "act" | "observe" | "explain"
+    content:     str,
+    tool_name:   Optional[str] = None,
+    tool_args:   Optional[dict] = None,
+    tool_result: Optional[dict] = None,
+) -> dict:
+    return {
+        "step":        step,
+        "kind":        kind,
+        "content":     content,
+        "tool_name":   tool_name,
+        "tool_args":   tool_args,
+        "tool_result": tool_result,
+    }
+
+
+def _extract_reasoning(message: Any) -> str:
+    """
+    Pull the model's reasoning text. gpt-oss on Groq returns it on a separate
+    channel — additional_kwargs['reasoning_content'] via ChatGroq — and leaves
+    .content empty on tool-call turns. Fall back to .content for the final turn.
+    """
+    extra = getattr(message, "additional_kwargs", {}) or {}
+    reasoning = extra.get("reasoning_content") or extra.get("reasoning") or ""
+    if not reasoning:
+        content = getattr(message, "content", "") or ""
+        reasoning = content if isinstance(content, str) else ""
+    return reasoning.strip()
+
+
+def _message_text(message: Any) -> str:
+    content = getattr(message, "content", "") or ""
+    return content.strip() if isinstance(content, str) else ""
+
+
+# ── Graph factory ───────────────────────────────────────────────────────────────
+
+def build_dj_graph(
+    tools:          list,
+    stop_tool:      str,
+    model:          str = MODEL,
+    temperature:    float = 0.3,
+    max_retries:    int = 4,
+):
+    """
+    Build and compile a ReAct graph over ``tools``, terminating when
+    ``stop_tool`` returns a dict with ``success`` True.
+
+    Returns the compiled graph. The caller invokes it with an initial DJState
+    and a config carrying ``recursion_limit`` (see ``run_graph``). The same
+    factory builds the mid-session cycle graph (tools=CYCLE_TOOLS,
+    stop_tool="add_track_to_queue") and the opener graph (Phase 3).
+    """
+    llm = ChatGroq(model=model, temperature=temperature, max_retries=max_retries)
+    llm_with_tools = llm.bind_tools(tools)
+    registry = {t.name: t for t in tools}
+
+    # ── agent node ──────────────────────────────────────────────
+    def agent_node(state: DJState) -> dict:
+        response = llm_with_tools.invoke(state["messages"])
+        trace = list(state.get("trace", []))
+        step  = state.get("step", 1)
+
+        reasoning = _extract_reasoning(response)
+        if reasoning:
+            trace.append(_trace_entry(step, "think", reasoning))
+            step += 1
+
+        update: dict = {"messages": [response], "trace": trace, "step": step}
+
+        # No tool calls → the assistant has given its final answer.
+        if not getattr(response, "tool_calls", None):
+            explanation = _message_text(response) or reasoning
+            if explanation:
+                trace.append(_trace_entry(step, "explain", explanation))
+                step += 1
+                update["trace"] = trace
+                update["step"]  = step
+            update["explanation"] = explanation
+        return update
+
+    # ── tools node ──────────────────────────────────────────────
+    def tools_node(state: DJState) -> dict:
+        last  = state["messages"][-1]
+        trace = list(state.get("trace", []))
+        step  = state.get("step", 1)
+        terminal = state.get("terminal")
+        out_messages = []
+
+        for tc in last.tool_calls:
+            name = tc["name"]
+            args = tc.get("args", {}) or {}
+            tool = registry.get(name)
+            if tool is None:
+                result = {"error": f"Unknown tool: {name}"}
+            else:
+                try:
+                    result = tool.invoke(args)
+                except Exception as exc:                       # noqa: BLE001
+                    result = {"error": f"Tool '{name}' raised: {exc}"}
+
+            trace.append(_trace_entry(
+                step       = step,
+                kind       = "act",
+                content    = name,
+                tool_name  = name,
+                tool_args  = args,
+                tool_result= result if isinstance(result, dict) else {"value": result},
+            ))
+            step += 1
+
+            out_messages.append(ToolMessage(
+                content=json.dumps(result, default=str),
+                tool_call_id=tc["id"],
+            ))
+
+            if (
+                name == stop_tool
+                and isinstance(result, dict)
+                and result.get("success")
+            ):
+                terminal = result
+
+        return {
+            "messages": out_messages,
+            "trace":    trace,
+            "step":     step,
+            "terminal": terminal,
+        }
+
+    # ── explain node (tool-less final turn) ─────────────────────
+    def explain_node(state: DJState) -> dict:
+        trace = list(state.get("trace", []))
+        step  = state.get("step", 1)
+        try:
+            response = llm.invoke(state["messages"])        # no tools bound
+            explanation = _message_text(response) or _extract_reasoning(response)
+        except Exception:                                    # noqa: BLE001
+            explanation = ""                                 # caller synthesises a fallback
+        if explanation:
+            trace.append(_trace_entry(step, "explain", explanation))
+            step += 1
+        return {"trace": trace, "step": step, "explanation": explanation}
+
+    # ── routers ─────────────────────────────────────────────────
+    def route_after_agent(state: DJState) -> str:
+        last = state["messages"][-1]
+        return "tools" if getattr(last, "tool_calls", None) else END
+
+    def route_after_tools(state: DJState) -> str:
+        return "explain" if state.get("terminal") else "agent"
+
+    # ── assemble ────────────────────────────────────────────────
+    g = StateGraph(DJState)
+    g.add_node("agent", agent_node)
+    g.add_node("tools", tools_node)
+    g.add_node("explain", explain_node)
+    g.add_edge(START, "agent")
+    g.add_conditional_edges("agent", route_after_agent, {"tools": "tools", END: END})
+    g.add_conditional_edges("tools", route_after_tools, {"explain": "explain", "agent": "agent"})
+    g.add_edge("explain", END)
+    return g.compile()
+
+
+# ── Convenience runner (used by loop.py in Phase 2) ─────────────────────────────
+
+def run_graph(
+    graph,
+    messages:        list,
+    seen_tracks:     Optional[dict] = None,
+    max_iterations:  int = MAX_ITERATIONS,
+) -> dict:
+    """
+    Invoke a compiled DJ graph and normalise the final state into the shape the
+    public loop functions expect: {"queued": <terminal|None>, "explanation": str,
+    "trace": list}. ``recursion_limit`` is derived from max_iterations (each ReAct
+    turn is agent+tools = 2 graph steps, plus a margin for the explain node).
+    """
+    initial: DJState = {
+        "messages":    messages,
+        "trace":       [],
+        "step":        1,
+        "terminal":    None,
+        "explanation": "",
+        "seen_tracks": seen_tracks if seen_tracks is not None else {},
+    }
+    final = graph.invoke(initial, config={"recursion_limit": max_iterations * 2 + 2})
+    return {
+        "queued":      final.get("terminal"),
+        "explanation": final.get("explanation", ""),
+        "trace":       final.get("trace", []),
+    }

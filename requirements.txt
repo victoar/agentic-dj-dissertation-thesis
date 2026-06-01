@@ -5,6 +5,7 @@ pylast
 python-dotenv
 groq
 langchain
+langchain-groq
 langgraph
 music21
 pydantic

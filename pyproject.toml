@@ -17,6 +17,7 @@ dependencies = [
     "openai",
     "groq",
     "langchain",
+    "langchain-groq",
     "langgraph",
     "music21",
     "streamlit",
