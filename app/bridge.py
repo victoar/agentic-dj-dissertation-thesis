@@ -89,9 +89,13 @@ def start_session_from_description(description: str) -> dict:
     """Interpret a natural language description, start playback, and fill the buffer."""
     result = start_session(description, verbose=False)
     if result.get("success"):
-        st.session_state.session_label = result.get("session_label", "")
-        st.session_state.start_status  = "idle"
-        st.session_state.start_error   = ""
+        st.session_state.session_label    = result.get("session_label", "")
+        st.session_state.start_status     = "idle"
+        st.session_state.start_error      = ""
+        # Surface the opener's reasoning/trace so the Now Playing + Agent Trace
+        # tabs show why the first track was chosen (handle_feedback does the same).
+        st.session_state.last_explanation = result.get("explanation", "")
+        st.session_state.last_trace       = result.get("trace", [])
         refresh()
         ensure_buffer(2)
     else:

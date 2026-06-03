@@ -1,267 +1,78 @@
 """
-ReAct agent loop — the reasoning core of the Agentic DJ system.
+ReAct agent orchestration — the reasoning core of the Agentic DJ system.
 
-Both entry points (run_agent_cycle, start_session) are implemented as true
-Reason → Act → Observe loops on Groq's native function-calling. The model
-is given a goal and a toolbox; it decides which tools to call, in what
+Both entry points (run_agent_cycle, start_session) are implemented as compiled
+LangGraph ReAct graphs (see graph.py) over ChatGroq's native function-calling.
+The model is given a goal and a toolbox; it decides which tools to call, in what
 order, and when it has gathered enough to commit. No procedural rules.
 
-Every iteration logs:
-  • a `think` trace entry  (the model's natural-language reasoning, if any)
+Every graph turn logs:
+  • a `think` trace entry  (the model's reasoning, read from reasoning_content)
   • one `act`   trace entry per tool call  (tool name, arguments, result)
+  • an `explain` entry for the final natural-language explanation
 
 This makes the trace a faithful record of the agent's behaviour — the
 substrate the dissertation's failure taxonomy (state lag, novelty
 miscalibration, arc rigidity, key tunnel vision) is built on.
 
 Architecture:
-  - Single generic _run_react_loop driver, parametrised by tool registry
-    and the name of the terminal "stop tool".
+  - Graphs are built by graph.build_dj_graph / build_opener_graph and driven by
+    graph.run_graph. The tools are LangChain tool objects from lc_tools.
   - run_agent_cycle uses a Python pre-fetch step to build a scored candidate
-    shortlist, then passes it to a focused LLM loop (CYCLE_TOOLS — no search)
-    that only needs to verify harmonic fit and commit. Falls back to full
-    GROQ_TOOLS if the pre-fetch returns nothing.
-  - start_session uses a focused inner toolset (search + select-opening)
-    and stops on a synthetic select_opening_track tool defined inline.
-  - A structured-JSON pre-step in start_session extracts the vibe vector
-    from the description. Extraction is one-shot by design — reasoning
-    happens in the sub-loop that picks the actual track.
+    shortlist, then runs the cycle graph (lc_tools.CYCLE_TOOLS — no search) so
+    the LLM only verifies harmonic fit and commits. Falls back to the full
+    toolset (lc_tools.ALL_TOOLS) graph if the pre-fetch returns nothing, and to
+    a scored fallback if the graph still does not commit.
+  - start_session runs the opener graph (lc_tools.OPENER_TOOLS) which stops on
+    the synthetic select_opening_track tool; its anti-hallucination guard lives
+    in the opener graph node (validates against seen_tracks in graph state).
+  - A structured-JSON pre-step in start_session extracts the vibe vector from
+    the description via a single ChatGroq call (no tools).
+  - Rate-limit backoff is delegated to ChatGroq(max_retries=4); there is no
+    custom retry layer here.
 """
 
 import json
-import os
 import threading
-import time
-from typing import Any
 
-from groq import Groq
 from dotenv import load_dotenv
 from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_groq import ChatGroq
 
 from agentic_dj.agent import tools as tool_module
 from agentic_dj.agent import lc_tools
 from agentic_dj.agent.graph import build_dj_graph, build_opener_graph, run_graph
 from agentic_dj.agent.state import init_state_from_values
+from agentic_dj.music.camelot import parse as camelot_parse, compatibility_strength
 from agentic_dj.music.tags import prewarm_embedding_model
+
+# BPM jump tolerance per arc phase (mirrors estimate_bpm_compatibility in tools.py):
+# tight in steady-state phases, wide where energy is intentionally shifting.
+_BPM_THRESHOLDS = {"warmup": 8.0, "build": 25.0, "peak": 8.0, "cooldown": 25.0}
+# A harmonic transition scoring ≥ this is "acceptable" (matches check_transition).
+_HARMONIC_MIN = 0.4
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 load_dotenv()
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 MODEL  = "openai/gpt-oss-120b"
 
 DISPLAY_LOGS: bool = True       # set False to silence the trace stream
-MAX_ITERATIONS:       int = 15  # safety cap on a single ReAct loop
-MAX_BACKOFF_ATTEMPTS: int = 4   # exponential backoff retries on 429
+MAX_ITERATIONS: int = 15        # safety cap per ReAct loop (graph recursion limit)
+
+# Rate-limit backoff is handled natively by ChatGroq(max_retries=...) inside the
+# compiled graphs (graph.py) — there is no custom retry layer here.
+
+# Lazy ChatGroq used only for the structured-JSON vibe extraction in start_session
+# (a single non-tool call). The graphs build their own ChatGroq instances.
+_INTERPRET_LLM = None
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  TOOL CATALOGUE  —  the 12 tools the cycle loop reasons over
-# ══════════════════════════════════════════════════════════════════════════════
-#
-# Plain JSON schemas, OpenAI / Groq compatible. Each declaration is the
-# single source of truth: GROQ_TOOLS wraps it in the API envelope, and
-# TOOL_REGISTRY maps the name back to the Python function.
-
-TOOL_DECLARATIONS: list[dict] = [
-    {
-        "name": "get_listener_state",
-        "description": "Return the current listener state vector — energy, valence, focus, openness, social, arc_phase.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "update_listener_state",
-        "description": "Update the listener state based on a feedback event.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "event":      {"type": "string", "description": "skip, early_skip, replay, full_listen, partial_listen, thumbs_up, thumbs_down"},
-                "track_name": {"type": "string"},
-                "artist":     {"type": "string"},
-            },
-            "required": ["event", "track_name", "artist"],
-        },
-    },
-    {
-        "name": "get_session_arc",
-        "description": "Return the current arc phase and a description of what it means for track selection.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "get_compatible_keys",
-        "description": "Return all harmonically compatible Camelot positions for a given key.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "camelot_position": {"type": "string", "description": "e.g. '8B', '4A'"},
-            },
-            "required": ["camelot_position"],
-        },
-    },
-    {
-        "name": "check_transition",
-        "description": "Check harmonic smoothness between two Camelot positions. Returns a score 0.0–1.0 and a verdict.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "from_camelot": {"type": "string"},
-                "to_camelot":   {"type": "string"},
-            },
-            "required": ["from_camelot", "to_camelot"],
-        },
-    },
-    {
-        "name": "estimate_bpm_compatibility",
-        "description": "Check whether a BPM jump between two tracks is smooth for the current arc phase.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "current_bpm":   {"type": "number"},
-                "candidate_bpm": {"type": "number"},
-                "arc_phase":     {"type": "string"},
-            },
-            "required": ["current_bpm", "candidate_bpm"],
-        },
-    },
-    {
-        "name": "search_tracks_by_tag",
-        "description": (
-            "Search for tracks by Last.fm tag — the accurate way to find music by mood or genre. "
-            "Use this for descriptive queries like 'energetic', 'chill', 'melancholic', 'dark', "
-            "'happy', 'anthemic', 'ambient', 'upbeat', 'mellow'. "
-            "Last.fm tags are crowdsourced by millions of listeners and map directly to moods/genres. "
-            "Prefer this over search_tracks for any mood or energy query."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "tag":   {"type": "string",  "description": "A Last.fm mood/genre tag e.g. 'energetic', 'chill', 'dark'"},
-                "limit": {"type": "integer", "description": "Max candidates (default 15)"},
-            },
-            "required": ["tag"],
-        },
-    },
-    {
-        "name": "search_artist_tracks",
-        "description": (
-            "Get an artist's most popular tracks, resolved to Spotify. "
-            "Use this when the listener wants tracks from a specific artist — it fetches their "
-            "top tracks from Last.fm ranked by listener count, far more reliable than a Spotify "
-            "text search which may return covers or tribute acts."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "artist": {"type": "string",  "description": "Artist name e.g. 'Radiohead'"},
-                "limit":  {"type": "integer", "description": "Max candidates (default 15)"},
-            },
-            "required": ["artist"],
-        },
-    },
-    {
-        "name": "search_tracks",
-        "description": "Search Spotify by text query for a specific track or artist name. Use for precise lookups like 'Creep Radiohead' or 'One More Time Daft Punk'. For mood/energy queries use search_tracks_by_tag instead; for artist catalogues use search_artist_tracks instead.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string"},
-                "limit": {"type": "integer"},
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "search_tracks_by_playlist",
-        "description": "Search for Spotify playlists matching a vibe, era, or mood description and return a sample of tracks from those playlists. Use for era-specific queries like '2016 pop hits' or 'chill Sunday morning'. Returns raw metadata only — no BPM or key data.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query":       {"type": "string",  "description": "Short playlist-style search string, e.g. '2016 pop hits'"},
-                "sample_size": {"type": "integer", "description": "Max candidates to return (default 20)"},
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "get_track_details",
-        "description": "Get full details for a specific track — metadata, tags, energy, valence, BPM, Camelot key.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "track_name": {"type": "string"},
-                "artist":     {"type": "string"},
-            },
-            "required": ["track_name", "artist"],
-        },
-    },
-    {
-        "name": "get_current_playback",
-        "description": "Return what is currently playing on Spotify — track name, artist, progress.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "get_queue_state",
-        "description": "Return the current planned queue and upcoming tracks.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "get_session_history",
-        "description": "Return tracks played so far this session, most recent first.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-    {
-        "name": "add_track_to_queue",
-        "description": "Add a track to the Spotify playback queue. This is the terminal action — call it once with the single best candidate.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "track_name": {"type": "string"},
-                "artist":     {"type": "string"},
-            },
-            "required": ["track_name", "artist"],
-        },
-    },
-]
-
-# Groq/OpenAI function-call envelope
-GROQ_TOOLS: list[dict] = [
-    {"type": "function", "function": decl} for decl in TOOL_DECLARATIONS
-]
-
-# Focused schema for mid-session cycles — search is done in the Python pre-step,
-# so we strip all four search tools from the tool list.
-# This prevents the LLM from burning iterations on a redundant second search
-# when a scored shortlist is already injected into the user message.
-# Falls back to full GROQ_TOOLS when the pre-step returns no candidates.
-_SEARCH_TOOL_NAMES = {
-    "search_tracks_by_tag",
-    "search_artist_tracks",
-    "search_tracks",
-    "search_tracks_by_playlist",
-}
-CYCLE_TOOLS: list[dict] = [
-    t for t in GROQ_TOOLS
-    if t["function"]["name"] not in _SEARCH_TOOL_NAMES
-]
-
-# Name → Python function lookup for tool execution
-TOOL_REGISTRY: dict[str, Any] = {
-    "get_listener_state":         tool_module.get_listener_state,
-    "update_listener_state":      tool_module.update_listener_state,
-    "get_session_arc":            tool_module.get_session_arc,
-    "get_compatible_keys":        tool_module.get_compatible_keys,
-    "check_transition":           tool_module.check_transition,
-    "estimate_bpm_compatibility": tool_module.estimate_bpm_compatibility,
-    "search_tracks_by_tag":       tool_module.search_tracks_by_tag,
-    "search_artist_tracks":       tool_module.search_artist_tracks,
-    "search_tracks":              tool_module.search_tracks,
-    "search_tracks_by_playlist":  tool_module.search_tracks_by_playlist,
-    "get_track_details":          tool_module.get_track_details,
-    "get_current_playback":       tool_module.get_current_playback,
-    "get_queue_state":            tool_module.get_queue_state,
-    "get_session_history":        tool_module.get_session_history,
-    "add_track_to_queue":         tool_module.add_track_to_queue,
-}
+def _get_interpret_llm():
+    global _INTERPRET_LLM
+    if _INTERPRET_LLM is None:
+        _INTERPRET_LLM = ChatGroq(model=MODEL, temperature=0.3, max_retries=4)
+    return _INTERPRET_LLM
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -358,191 +169,6 @@ def _trace_entry(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  GROQ CALL WITH EXPONENTIAL BACKOFF
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _groq_call(
-    messages:    list[dict],
-    tools:       list[dict] | None = None,
-    tool_choice: str = "auto",
-) -> Any:
-    """
-    Wrap client.chat.completions.create with retry on 429 / rate-limit errors.
-    Waits 2s, 4s, 8s, 16s between attempts.
-    Other exceptions propagate immediately.
-    """
-    kwargs: dict[str, Any] = {
-        "model":       MODEL,
-        "messages":    messages,
-        "temperature": 0.3,
-    }
-    if tools is not None:
-        kwargs["tools"]       = tools
-        kwargs["tool_choice"] = tool_choice
-
-    last_exc: Exception | None = None
-    for attempt in range(MAX_BACKOFF_ATTEMPTS):
-        try:
-            return client.chat.completions.create(**kwargs)
-        except Exception as e:
-            last_exc = e
-            err = str(e).lower()
-            if "429" in str(e) or "rate_limit" in err or "too many" in err:
-                wait = (2 ** attempt) * 2   # 2s, 4s, 8s, 16s
-                if DISPLAY_LOGS:
-                    print(f"[rate limit] waiting {wait}s (retry {attempt + 1}/{MAX_BACKOFF_ATTEMPTS})")
-                time.sleep(wait)
-            else:
-                raise
-    raise RuntimeError(
-        f"Groq rate limit exceeded after {MAX_BACKOFF_ATTEMPTS} retries"
-    ) from last_exc
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  REACT LOOP DRIVER
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _run_react_loop(
-    messages:       list[dict],
-    trace:          list[dict],
-    max_iterations: int = MAX_ITERATIONS,
-    registry:       dict[str, Any] | None = None,
-    tools_schema:   list[dict] | None = None,
-    stop_tool:      str = "add_track_to_queue",
-    log_prefix:     str = "react",
-) -> dict:
-    """
-    Drive a Reason→Act→Observe loop until `stop_tool` fires successfully
-    or `max_iterations` is reached.
-
-    On each iteration:
-      1. Call Groq with messages + tools.
-      2. If the assistant produced reasoning text, append a 'think' trace entry.
-      3. Append the assistant turn to messages (so its tool-call envelopes
-         are visible to the next iteration).
-      4. If no tool calls, the assistant has given its final answer — record
-         an 'explain' entry and return.
-      5. Otherwise execute each tool call, log an 'act' entry per call,
-         and append the result as a 'tool' message.
-      6. If `stop_tool` succeeded, ask Groq once more (tools disabled) for
-         its plain-language explanation and return.
-
-    Returns: {"queued": <stop_tool_result_or_None>, "explanation": <str>}
-    """
-    if registry is None:
-        registry = TOOL_REGISTRY
-    if tools_schema is None:
-        tools_schema = GROQ_TOOLS
-
-    terminal:    dict | None = None
-    explanation: str         = ""
-    step:        int         = 1
-
-    for iteration in range(max_iterations):
-        # ── 1. Ask the model ──────────────────────────────────
-        response = _groq_call(messages, tools=tools_schema, tool_choice="auto")
-        msg      = response.choices[0].message
-        reasoning = (msg.content or "").strip()
-
-        # ── 2. Log reasoning text as a 'think' entry ──────────
-        if reasoning:
-            trace.append(_trace_entry(step, "think", reasoning))
-            if DISPLAY_LOGS:
-                print(f"\n[{log_prefix}/think] {reasoning[:240]}")
-            step += 1
-
-        # ── 3. Append assistant turn to the message history ───
-        assistant_msg: dict = {"role": "assistant", "content": msg.content or ""}
-        if msg.tool_calls:
-            assistant_msg["tool_calls"] = [
-                {
-                    "id":   tc.id,
-                    "type": "function",
-                    "function": {
-                        "name":      tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                }
-                for tc in msg.tool_calls
-            ]
-        messages.append(assistant_msg)
-
-        # ── 4. No tool calls → final text response ────────────
-        if not msg.tool_calls:
-            explanation = reasoning
-            if explanation:
-                trace.append(_trace_entry(step, "explain", explanation))
-                step += 1
-            break
-
-        # ── 5. Execute each tool call ─────────────────────────
-        stop_fired = False
-        for tool_call in msg.tool_calls:
-            name = tool_call.function.name
-            try:
-                args = json.loads(tool_call.function.arguments)
-            except json.JSONDecodeError:
-                args = {}
-            if not isinstance(args, dict):
-                args = {}
-
-            if DISPLAY_LOGS:
-                print(f"[{log_prefix}/act ] → {name}({json.dumps(args)[:140]})")
-
-            if name in registry:
-                try:
-                    result = registry[name](**args)
-                except Exception as exc:
-                    result = {"error": f"Tool '{name}' raised: {exc}"}
-            else:
-                result = {"error": f"Unknown tool: {name}"}
-
-            if DISPLAY_LOGS:
-                print(f"[{log_prefix}/obs ] ← {str(result)[:200]}")
-
-            trace.append(_trace_entry(
-                step       = step,
-                kind       = "act",
-                content    = name,
-                tool_name  = name,
-                tool_args  = args,
-                tool_result= result,
-            ))
-            step += 1
-
-            messages.append({
-                "role":         "tool",
-                "tool_call_id": tool_call.id,
-                "content":      json.dumps(result),
-            })
-
-            if (
-                name == stop_tool
-                and isinstance(result, dict)
-                and result.get("success")
-            ):
-                terminal   = result
-                stop_fired = True
-
-        # ── 6. If the stop tool fired, get the explanation ────
-        if stop_fired:
-            try:
-                final = _groq_call(messages, tools=None)
-                explanation = (final.choices[0].message.content or "").strip()
-                if explanation:
-                    trace.append(_trace_entry(step, "explain", explanation))
-                    step += 1
-            except Exception:
-                # Empty explanation — the public-facing function will
-                # synthesise a fallback string from the queued track.
-                pass
-            break
-
-    return {"queued": terminal, "explanation": explanation}
-
-
-# ══════════════════════════════════════════════════════════════════════════════
 #  SCORED FALLBACK  (safety net when the ReAct loop can't commit)
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -600,6 +226,92 @@ def _best_fallback_top_n(candidates: list[dict], state: dict, n: int = 3) -> lis
         return e_diff + v_diff   # lower = better fit
 
     return sorted(candidates, key=score)[:n]
+
+
+def _current_track_profile() -> dict | None:
+    """
+    Full enriched profile (tags, camelot_position, bpm, energy/valence) of the
+    track currently playing on Spotify. Looks it up in session history first; if
+    it is not there (e.g. the listener changed track directly in Spotify), it is
+    enriched on the fly via get_track_details (cached, so cheap on repeat).
+    Returns None when nothing is playing or the track cannot be resolved.
+    """
+    playback = tool_module.get_current_playback()
+    name     = (playback.get("track_name") or "").strip()
+    artist   = (playback.get("artist") or "").strip()
+    if not name:
+        return None
+
+    for entry in tool_module.get_session_history().get("recent", []):
+        if entry.get("name", "").lower() == name.lower():
+            return entry
+
+    details = tool_module.get_track_details(name, artist)
+    if isinstance(details, dict) and details.get("name") and not details.get("error"):
+        return details
+    return None
+
+
+def _search_seed_tags(state: dict, current: dict | None) -> list[str]:
+    """
+    Tags that drive candidate discovery — taken from the CURRENTLY PLAYING track's
+    top Last.fm tags (up to two) so the candidate pool stays on-genre with what's
+    playing. The listener's artist name is skipped (it often appears as a tag).
+
+    Energy/mood adaptation is intentionally NOT mixed in as a second tag here:
+    Last.fm tag search is single-tag, so adding e.g. 'indie' or 'chill' fetches a
+    separate off-genre pool (the bug where reggaeton playback pulled in indie
+    rock). Adaptation is applied downstream by ranking these on-genre candidates
+    on energy/valence distance. Falls back to state tags only when the current
+    track has no usable tags.
+    """
+    if current:
+        artist = (current.get("artist") or "").strip().lower()
+        seeds: list[str] = []
+        for t in current.get("tags", []):
+            tl = (t or "").strip().lower()
+            if tl and tl != artist and tl not in seeds:
+                seeds.append(tl)
+            if len(seeds) >= 2:
+                break
+        if seeds:
+            return seeds
+    return _state_to_tags(state)
+
+
+def _compatible_pool(
+    candidates:   list[dict],
+    state:        dict,
+    current_key:  str | None,
+    current_bpm:  float | None,
+) -> list[dict]:
+    """
+    Hard harmonic + tempo filter against the currently playing track. A candidate
+    is kept if its Camelot key is compatible (strength ≥ 0.4) AND its BPM is within
+    the arc-phase threshold. Unknown values (current or candidate) are treated as
+    compatible so missing Soundcharts data never empties the pool. If nothing
+    passes, returns the full list unchanged (soft degrade — never stall).
+    """
+    arc       = state.get("arc_phase", "build")
+    threshold = _BPM_THRESHOLDS.get(arc, 8.0)
+    from_key  = camelot_parse(current_key) if current_key else None
+
+    def harmonic_ok(c: dict) -> bool:
+        if from_key is None:
+            return True
+        to_key = camelot_parse(c.get("camelot_position") or "")
+        if to_key is None:
+            return True
+        return compatibility_strength(from_key, to_key) >= _HARMONIC_MIN
+
+    def bpm_ok(c: dict) -> bool:
+        cand_bpm = c.get("bpm")
+        if not current_bpm or not cand_bpm:
+            return True
+        return abs(current_bpm - cand_bpm) <= threshold
+
+    compatible = [c for c in candidates if harmonic_ok(c) and bpm_ok(c)]
+    return compatible if compatible else candidates
 
 
 def _state_to_tags(state: dict) -> list[str]:
@@ -719,9 +431,9 @@ def run_agent_cycle(
 
     A Python pre-step then searches for candidates, scores them by
     energy/valence fit, and injects the top 3 into the user message.
-    The LLM loop is given CYCLE_TOOLS (no search tools) so it can only
-    verify harmonic fit and commit — no iteration budget wasted on search.
-    If the pre-step finds nothing, falls back to full GROQ_TOOLS.
+    The cycle graph is given lc_tools.CYCLE_TOOLS (no search tools) so it can
+    only verify harmonic fit and commit — no iteration budget wasted on search.
+    If the pre-step finds nothing, falls back to the full-toolset graph.
 
     Returns:
       {
@@ -766,10 +478,15 @@ def run_agent_cycle(
     # Two tags are tried in order; results are merged and de-duplicated.
     # Falls back to Spotify text search only if both tag searches fail.
     state = tool_module.get_listener_state()
-    tags  = _state_to_tags(state)
+    # Seed discovery from the CURRENTLY PLAYING track's genre tags so candidates
+    # stay on-genre with what's playing. Energy/mood adaptation is applied later
+    # by ranking on energy/valence distance — not by mixing in an off-genre tag.
+    current = _current_track_profile()
+    tags    = _search_seed_tags(state, current)
 
     if verbose:
-        print(f"\n[pre-fetch] Last.fm tags: {tags}")
+        now = f"{current.get('name')} ({current.get('camelot_position')}/{current.get('bpm')})" if current else "?"
+        print(f"\n[pre-fetch] now playing: {now} → Last.fm seed tags: {tags}")
 
     raw_candidates: list[dict] = []
     seen_ids: set[str] = set()
@@ -793,15 +510,27 @@ def run_agent_cycle(
         if verbose:
             print(f"[pre-fetch] Last.fm empty — Spotify fallback query: '{query}'")
 
-    shortlist = _best_fallback_top_n(raw_candidates, state, n=3)
+    # Harmonic + tempo HARD filter against the currently playing track, then rank
+    # the survivors by energy/valence fit. This enforces transition compatibility
+    # deterministically rather than relying on the LLM to call check_transition.
+    current_key = current.get("camelot_position") if current else None
+    current_bpm = current.get("bpm") if current else None
+    compatible_pool = _compatible_pool(raw_candidates, state, current_key, current_bpm)
+    shortlist = _best_fallback_top_n(compatible_pool, state, n=3)
 
     trace.append(_trace_entry(
         step       = 0,
         kind       = "act",
-        content    = f"Pre-fetch: tags={tags} → {len(raw_candidates)} candidates → shortlist of {len(shortlist)}",
+        content    = (
+            f"Pre-fetch: tags={tags} → {len(raw_candidates)} candidates → "
+            f"{len(compatible_pool)} compatible (from key={current_key or '?'} "
+            f"BPM={current_bpm or '?'}) → shortlist of {len(shortlist)}"
+        ),
         tool_name  = "search_tracks_by_tag",
-        tool_args  = {"tags": tags},
-        tool_result= {"count": len(raw_candidates), "shortlist_size": len(shortlist)},
+        tool_args  = {"tags": tags, "from_key": current_key, "from_bpm": current_bpm},
+        tool_result= {"count": len(raw_candidates),
+                      "compatible": len(compatible_pool),
+                      "shortlist_size": len(shortlist)},
     ))
 
     if DISPLAY_LOGS and shortlist:
@@ -826,11 +555,22 @@ def run_agent_cycle(
                 f"  valence={c.get('valence_est', 0.5):.2f}"
                 f"  tags=[{tags_s}]"
             )
+        current_line = (
+            f"\n\nCurrently playing: key={current_key or 'unknown'} "
+            f"BPM={current_bpm or 'unknown'}. The candidates below have already been "
+            f"filtered to be harmonically and tempo compatible with it."
+            if (current_key or current_bpm) else ""
+        )
         candidate_section = (
-            f"\n\nPre-scored candidates from Last.fm tag search {tags}"
-            " (ranked best-first by energy/valence fit):\n"
+            current_line
+            + f"\n\nPre-scored candidates from Last.fm tag search {tags}"
+            " (already compatibility-filtered, ranked best-first by energy/valence fit):\n"
             + "\n".join(lines)
-            + "\n\nVerify harmonic fit of candidate #1, then commit with add_track_to_queue."
+            + (f"\n\nConfirm harmonic fit of candidate #1 with check_transition"
+               f"(from_camelot={current_key!r}, to_camelot=<candidate key>), then commit "
+               f"with add_track_to_queue."
+               if current_key else
+               "\n\nCommit candidate #1 with add_track_to_queue.")
         )
         use_full_tools = False   # search already done — no need for LLM to search
     else:
@@ -869,8 +609,8 @@ def run_agent_cycle(
     if not result.get("queued"):
         if verbose or DISPLAY_LOGS:
             print("[fallback] loop did not queue — using scored fallback")
-        # Reuse the pre-fetched candidates; only re-search if there were none
-        candidates = raw_candidates or tool_module.search_tracks(query, limit=8).get("candidates", [])
+        # Reuse the compatibility-filtered pool; only re-search if there was nothing
+        candidates = compatible_pool or tool_module.search_tracks(query, limit=8).get("candidates", [])
         best       = _best_fallback(candidates, state)
         if best:
             queue_result     = tool_module.add_track_to_queue(best["name"], best["artist"])
@@ -884,6 +624,14 @@ def run_agent_cycle(
     # ── 6. Normalise return shape ─────────────────────────────
     queued      = result.get("queued") or {}
     explanation = result.get("explanation", "")
+
+    # If the explain turn returned nothing, surface the model's own reasoning from
+    # the commit turn (last `think` entry) before falling back to a generic line.
+    if not explanation:
+        thinks = [t.get("content") for t in trace
+                  if t.get("kind") == "think" and t.get("content")]
+        if thinks:
+            explanation = thinks[-1]
 
     if not explanation:
         q = queued.get("queued", {}) if isinstance(queued, dict) else {}
@@ -963,8 +711,12 @@ def start_session(description: str, verbose: bool = False) -> dict:
         )
 
     # ── 3. ReAct sub-loop to pick the opener ──────────────────
+    # Run the opener whenever interpretation gave us something searchable. We do
+    # NOT gate on `confident`: a valid description the model marks low-confidence
+    # should still drive the opener, not jump straight to random favourites. The
+    # top-tracks fallback only triggers if the opener can't commit a real track.
     selected: dict | None = None
-    if confident and search_queries:
+    if search_queries:
         selected = _react_pick_opener(
             label          = session_label,
             vibe           = vibe or {},
@@ -1045,28 +797,35 @@ def _interpret_description(
     verbose:     bool = False,
 ) -> dict | None:
     """
-    Single structured-JSON Groq call. Returns the parsed vibe dict on
-    success, None on parse failure. Records a 'think' trace entry either
+    Single structured-JSON call via ChatGroq (no tools). Returns the parsed vibe
+    dict on success, None on parse failure. Records a 'think' trace entry either
     way so the bootstrap reasoning is visible to post-hoc analysis.
     """
     user_msg = SESSION_INTERPRET_USER.format(description=description)
 
     try:
-        response = _groq_call(
-            messages = [
-                {"role": "system", "content": SESSION_INTERPRET_SYSTEM},
-                {"role": "user",   "content": user_msg},
-            ],
-            tools = None,
-        )
-        raw = (response.choices[0].message.content or "").strip()
+        response = _get_interpret_llm().invoke([
+            SystemMessage(content=SESSION_INTERPRET_SYSTEM),
+            HumanMessage(content=user_msg),
+        ])
+        # gpt-oss often returns the JSON on the reasoning channel with empty
+        # .content — fall back to reasoning_content (same issue as the explain node).
+        raw = response.content if isinstance(response.content, str) else ""
+        raw = raw.strip()
+        if not raw:
+            raw = (getattr(response, "additional_kwargs", {}) or {}).get("reasoning_content", "") or ""
+            raw = raw.strip()
 
         # Strip markdown fences if the model added them despite the system prompt
         if "```" in raw:
             raw = raw.split("```")[1]
             if raw.startswith("json"):
                 raw = raw[4:]
-        parsed = json.loads(raw.strip())
+        raw = raw.strip()
+        # Be robust to any surrounding prose: take the outermost JSON object.
+        if "{" in raw and "}" in raw:
+            raw = raw[raw.index("{"): raw.rindex("}") + 1]
+        parsed = json.loads(raw)
 
         trace.append(_trace_entry(
             step       = 0,

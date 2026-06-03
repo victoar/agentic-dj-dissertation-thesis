@@ -45,7 +45,21 @@ _state:     ListenerState      = init_state("general")
 _history:   list[dict]         = []   # every track played this session
 _lookahead: list[str]          = []   # track IDs queued ahead but not yet playing
 
+# Session-scoped memoisation so the same track is not re-resolved / re-enriched
+# at each stage (pre-fetch → get_track_details → add_track_to_queue). Without
+# this a single committed track triggers 3× Spotify searches + enrichment.
+_resolve_cache:   dict[str, list] = {}   # search query  -> [SpotifyTrack]
+_candidate_cache: dict[str, dict] = {}   # spotify id    -> enriched candidate dict
+
 DISPLAY_LOGS: bool = False   # synced from loop.py at the start of each cycle
+
+
+def _resolve(query: str, limit: int = 1) -> list:
+    """Cached single-track Spotify resolve — avoids repeated identical searches."""
+    key = f"{query}|{limit}"
+    if key not in _resolve_cache:
+        _resolve_cache[key] = _spotify.search(query, limit=limit)
+    return _resolve_cache[key]
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -395,7 +409,7 @@ def search_tracks_by_tag(tag: str, limit: int = 15) -> dict:
         if not name or not artist:
             continue
 
-        results = _spotify.search(f"{name} {artist}", limit=1)
+        results = _resolve(f"{name} {artist}", limit=1)
         if not results:
             continue
         sp = results[0]
@@ -441,7 +455,7 @@ def search_artist_tracks(artist: str, limit: int = 15) -> dict:
         if not name:
             continue
 
-        results = _spotify.search(f"{name} {item_artist}", limit=1)
+        results = _resolve(f"{name} {item_artist}", limit=1)
         if not results:
             continue
         sp = results[0]
@@ -466,7 +480,7 @@ def get_track_details(track_name: str, artist: str) -> dict:
     Use this when you already know which track you want and need its
     complete feature profile before adding it to the queue.
     """
-    results = _spotify.search(f"{track_name} {artist}", limit=1)
+    results = _resolve(f"{track_name} {artist}", limit=1)
     if not results:
         return {"error": f"Track not found: {track_name} by {artist}"}
 
@@ -533,7 +547,7 @@ def add_track_to_queue(track_name: str, artist: str) -> dict:
     """
     global _queue, _history, _state
 
-    results = _spotify.search(f"{track_name} {artist}", limit=1)
+    results = _resolve(f"{track_name} {artist}", limit=1)
     if not results:
         return {"success": False, "error": f"Could not find '{track_name}' by {artist}"}
 
@@ -649,6 +663,8 @@ def reset_session(context: str = "general") -> dict:
     _queue     = []
     _history   = []
     _lookahead = []
+    _resolve_cache.clear()
+    _candidate_cache.clear()
     return {
         "reset":   True,
         "context": context,
@@ -684,7 +700,13 @@ def _spotify_to_candidate(sp_track: SpotifyTrack, enrich: bool = True) -> dict:
     """
     Convert a SpotifyTrack into a rich candidate dict the agent can reason over.
     Optionally enriches with Last.fm tags and feature estimates.
+
+    Enriched results are memoised by Spotify id for the session so the same
+    track is not re-enriched (Last.fm + Soundcharts + is_saved) at each stage.
     """
+    if enrich and sp_track.id and sp_track.id in _candidate_cache:
+        return dict(_candidate_cache[sp_track.id])   # copy — callers may mutate
+
     candidate: dict[str, Any] = {
         "id":          sp_track.id,
         "name":        sp_track.name,
@@ -727,6 +749,9 @@ def _spotify_to_candidate(sp_track: SpotifyTrack, enrich: bool = True) -> dict:
             print(f"  [soundcharts/{status}] {sp_track.artist} — {sp_track.name}  →  {bpm_str}  {key_str}")
 
     candidate["key"] = candidate.get("camelot_position")
+
+    if enrich and sp_track.id:
+        _candidate_cache[sp_track.id] = dict(candidate)
 
     return candidate
 

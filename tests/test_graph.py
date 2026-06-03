@@ -28,9 +28,11 @@ class FakeChatGroq:
         return self                       # same object → shares the script
 
     def invoke(self, messages):
-        msg = FakeChatGroq.script[FakeChatGroq.idx]
+        item = FakeChatGroq.script[FakeChatGroq.idx]
         FakeChatGroq.idx += 1
-        return msg
+        if isinstance(item, Exception):   # scripted failure (e.g. tool_use_failed)
+            raise item
+        return item
 
 
 @pytest.fixture(autouse=True)
@@ -113,6 +115,62 @@ def test_no_tool_calls_ends_with_final_text():
     assert [e["kind"] for e in out["trace"]] == ["think", "explain"]
     assert out["trace"][0]["content"] == "No suitable candidate; hold the queue."
     assert out["trace"][1]["content"] == "I have nothing to queue right now."
+
+
+# ── gpt-oss harmony-token tool-name corruption ──────────────────────────────────
+
+def test_clean_tool_name():
+    assert graph_mod._clean_tool_name("search_tracks<|channel|>commentary") == "search_tracks"
+    assert graph_mod._clean_tool_name("functions.add_track_to_queue") == "add_track_to_queue"
+    assert graph_mod._clean_tool_name("get_listener_state") == "get_listener_state"
+
+
+def test_tool_use_failed_is_retried_then_succeeds():
+    # First invoke raises Groq's 400; the retry re-samples and returns a clean call.
+    FakeChatGroq.script = [
+        RuntimeError("Error code: 400 - tool_use_failed: tool call validation failed"),
+        _ai_tool_call("add_track_to_queue", {"track_name": "Time", "artist": "Pink Floyd"}, "c1"),
+        AIMessage(content="Queued 'Time'."),
+    ]
+    graph = graph_mod.build_dj_graph(TOOLS, stop_tool="add_track_to_queue")
+    out = graph_mod.run_graph(graph, [HumanMessage("Pick the next track.")])
+    assert out["queued"]["success"] is True
+
+
+def test_tool_use_failed_exhausted_ends_gracefully():
+    # Every attempt fails → agent returns a tool-less message → graph ends with
+    # no queued track (the Python fallback in run_agent_cycle then takes over).
+    FakeChatGroq.script = [
+        RuntimeError("tool_use_failed") for _ in range(graph_mod.TOOL_RETRY_ATTEMPTS)
+    ]
+    graph = graph_mod.build_dj_graph(TOOLS, stop_tool="add_track_to_queue")
+    out = graph_mod.run_graph(graph, [HumanMessage("Pick the next track.")])
+    assert out["queued"] is None     # did not crash; no commit
+
+
+def test_non_tool_error_propagates():
+    FakeChatGroq.script = [RuntimeError("some other API error")]
+    graph = graph_mod.build_dj_graph(TOOLS, stop_tool="add_track_to_queue")
+    with pytest.raises(RuntimeError, match="some other API error"):
+        graph_mod.run_graph(graph, [HumanMessage("go")])
+
+
+def test_corrupted_tool_name_is_sanitized_and_executes():
+    # The model leaks a harmony channel token into the tool name; with
+    # disable_tool_validation Groq returns it, and the graph must still execute
+    # the right tool and record the clean name in the trace.
+    FakeChatGroq.script = [
+        _ai_tool_call("add_track_to_queue<|channel|>commentary",
+                      {"track_name": "Time", "artist": "Pink Floyd"}, "c1",
+                      reasoning="Commit it."),
+        AIMessage(content="Queued 'Time'."),
+    ]
+    graph = graph_mod.build_dj_graph(TOOLS, stop_tool="add_track_to_queue")
+    out = graph_mod.run_graph(graph, [HumanMessage("Pick the next track.")])
+
+    assert out["queued"]["success"] is True
+    act = next(e for e in out["trace"] if e["kind"] == "act")
+    assert act["tool_name"] == "add_track_to_queue"   # cleaned, not the corrupted name
 
 
 # ── Opener graph (natural-language session start) ───────────────────────────────

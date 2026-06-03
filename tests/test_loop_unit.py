@@ -1,216 +1,278 @@
 """
-Unit tests for the Groq ReAct agent loop.
+Unit tests for the agent loop (post-LangGraph migration).
 
-No external API calls — the Groq client is mocked via unittest.mock.patch.
-Run with: pytest tests/test_loop_unit.py -v
+No external API calls. The graph layer is mocked: run_agent_cycle's Python
+pre-step (Last.fm / Spotify search) and the compiled graph are patched so the
+loop's orchestration — feedback application, trace assembly, fallback, return
+shape — can be tested in isolation.
+
+The ReAct graph engine itself is covered by tests/test_graph.py; the tool
+schemas by tests/test_lc_tools.py.
 """
 
-import json
 import pytest
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import agentic_dj.agent.loop as loop_module
 import agentic_dj.agent.tools as tool_module
-from agentic_dj.agent.loop import (
-    GROQ_TOOLS,
-    TOOL_DECLARATIONS,
-    TOOL_REGISTRY,
-    _best_fallback,
-    _run_react_loop,
-    run_agent_cycle,
-)
+from agentic_dj.agent.loop import _best_fallback, _compatible_pool, run_agent_cycle
 
 
-# ── Helper ────────────────────────────────────────────────────────────────────
+# ── _compatible_pool() — hard harmonic + tempo filter (fixes out-of-key picks) ──
 
-def _make_mock_response(tool_name=None, tool_args=None, content="", tool_id="call_001"):
-    """Build a MagicMock that mimics a Groq chat completion response."""
-    mock_resp = MagicMock()
-    msg = mock_resp.choices[0].message
-    msg.content = content
-    if tool_name:
-        tc = MagicMock()
-        tc.id = tool_id
-        tc.function.name = tool_name
-        tc.function.arguments = json.dumps(tool_args or {})
-        msg.tool_calls = [tc]
-    else:
-        msg.tool_calls = None
-    return mock_resp
+def _cand(name, key, bpm, energy=0.5, valence=0.5):
+    return {"id": name, "name": name, "artist": "A", "camelot_position": key,
+            "bpm": bpm, "energy_est": energy, "valence_est": valence}
 
 
-# ── Group 1: Static structure ─────────────────────────────────────────────────
-
-def test_groq_tools_count():
-    """GROQ_TOOLS and TOOL_DECLARATIONS must have the same length (12)."""
-    assert len(GROQ_TOOLS) == 12
-    assert len(GROQ_TOOLS) == len(TOOL_DECLARATIONS)
-
-
-def test_groq_tools_envelope():
-    """Every entry in GROQ_TOOLS must have the correct Groq/OpenAI envelope."""
-    for tool in GROQ_TOOLS:
-        assert tool["type"] == "function", f"Missing type=function: {tool}"
-        fn = tool["function"]
-        assert "name"        in fn, f"Missing name in function: {fn}"
-        assert "description" in fn, f"Missing description in function: {fn}"
-        assert "parameters"  in fn, f"Missing parameters in function: {fn}"
+def test_compatible_pool_drops_incompatible_key():
+    state = {"arc_phase": "build", "energy": 0.5, "valence": 0.5}
+    cands = [_cand("Good", "1B", 120), _cand("Bad", "6B", 120)]  # from 12B: 1B=0.85, 6B=0.10
+    pool = _compatible_pool(cands, state, current_key="12B", current_bpm=120)
+    names = {c["name"] for c in pool}
+    assert "Good" in names and "Bad" not in names
 
 
-def test_tool_registry_completeness():
-    """Every tool declared in TOOL_DECLARATIONS must be callable via TOOL_REGISTRY."""
-    for decl in TOOL_DECLARATIONS:
-        name = decl["name"]
-        assert name in TOOL_REGISTRY,       f"Missing from TOOL_REGISTRY: {name}"
-        assert callable(TOOL_REGISTRY[name]), f"Not callable in TOOL_REGISTRY: {name}"
+def test_compatible_pool_drops_out_of_tempo():
+    # warmup → tight 8 BPM window; 142→124 (18 apart) must be excluded.
+    state = {"arc_phase": "warmup", "energy": 0.5, "valence": 0.5}
+    cands = [_cand("Close", "12B", 140), _cand("Far", "12B", 124)]
+    pool = _compatible_pool(cands, state, current_key="12B", current_bpm=142)
+    names = {c["name"] for c in pool}
+    assert "Close" in names and "Far" not in names
 
 
-def test_tool_registry_no_extras():
-    """TOOL_REGISTRY must not contain names absent from TOOL_DECLARATIONS."""
-    declared = {d["name"] for d in TOOL_DECLARATIONS}
-    for name in TOOL_REGISTRY:
-        assert name in declared, f"Extra entry in TOOL_REGISTRY not in TOOL_DECLARATIONS: {name}"
+def test_compatible_pool_unknown_current_key_keeps_all():
+    state = {"arc_phase": "build", "energy": 0.5, "valence": 0.5}
+    cands = [_cand("X", "1B", 120), _cand("Y", "6B", 200)]
+    # No current key and no current BPM → cannot filter → keep everything.
+    assert len(_compatible_pool(cands, state, current_key=None, current_bpm=None)) == 2
 
 
-# ── Group 2: _best_fallback() ─────────────────────────────────────────────────
+def test_compatible_pool_never_returns_empty():
+    state = {"arc_phase": "peak", "energy": 0.5, "valence": 0.5}
+    cands = [_cand("OnlyBad", "6B", 124)]  # incompatible on both axes
+    pool = _compatible_pool(cands, state, current_key="12B", current_bpm=142)
+    assert pool == cands   # soft degrade rather than stall
+
+
+# ── _best_fallback() — scored safety net (unchanged by the migration) ───────────
 
 def test_best_fallback_picks_closest():
-    """Picks the candidate with the smallest energy+valence distance to target."""
     state = {"energy": 0.8, "valence": 0.7}
     candidates = [
-        {"name": "Far Track",  "artist": "A", "energy_est": 0.2, "valence_est": 0.1},
+        {"name": "Far Track",  "artist": "A", "energy_est": 0.2,  "valence_est": 0.1},
         {"name": "Near Track", "artist": "B", "energy_est": 0.75, "valence_est": 0.65},
-        {"name": "Mid Track",  "artist": "C", "energy_est": 0.5, "valence_est": 0.5},
+        {"name": "Mid Track",  "artist": "C", "energy_est": 0.5,  "valence_est": 0.5},
     ]
-    result = _best_fallback(candidates, state)
-    assert result["name"] == "Near Track"
+    assert _best_fallback(candidates, state)["name"] == "Near Track"
 
 
 def test_best_fallback_empty():
-    """Empty candidate list returns an empty dict."""
     assert _best_fallback([], {"energy": 0.5, "valence": 0.5}) == {}
 
 
 def test_best_fallback_penalizes_bpm_camelot():
-    """bpm_ok=False and camelot_ok=False each add +0.2 to the score (lower = better).
-
-    A candidate with perfect energy/valence match but both flags False (score=0.4)
-    should lose to one that is 0.1 off in each dimension but has no flags (score=0.2).
-    """
     state = {"energy": 0.5, "valence": 0.5}
     candidates = [
         {"name": "Flag Track",    "artist": "A", "energy_est": 0.5, "valence_est": 0.5,
          "bpm_ok": False, "camelot_ok": False},
         {"name": "Healthy Track", "artist": "B", "energy_est": 0.6, "valence_est": 0.6},
     ]
-    result = _best_fallback(candidates, state)
-    assert result["name"] == "Healthy Track"
+    assert _best_fallback(candidates, state)["name"] == "Healthy Track"
 
 
-# ── Group 3: run_agent_cycle() return shape ───────────────────────────────────
+# ── start_session opener: interpret robustness + gate ───────────────────────────
+
+class _FakeMsg:
+    def __init__(self, content="", reasoning=""):
+        self.content = content
+        self.additional_kwargs = {"reasoning_content": reasoning} if reasoning else {}
+
+
+class _FakeLLM:
+    def __init__(self, msg):
+        self._msg = msg
+
+    def invoke(self, messages):
+        return self._msg
+
+
+def test_interpret_reads_json_from_reasoning_channel():
+    # gpt-oss puts the JSON on the reasoning channel with empty .content
+    msg = _FakeMsg(content="", reasoning='{"energy":0.8,"search_queries":["x"],'
+                                         '"session_label":"L","confident":true}')
+    with patch.object(loop_module, "_get_interpret_llm", return_value=_FakeLLM(msg)):
+        vibe = loop_module._interpret_description("clubbing", trace=[])
+    assert vibe and vibe["session_label"] == "L" and vibe["search_queries"] == ["x"]
+
+
+def test_interpret_extracts_json_from_surrounding_prose():
+    msg = _FakeMsg(content='Sure! {"energy":0.3,"search_queries":["calm"],'
+                           '"session_label":"Calm","confident":false} hope that helps')
+    with patch.object(loop_module, "_get_interpret_llm", return_value=_FakeLLM(msg)):
+        vibe = loop_module._interpret_description("calm sunday", trace=[])
+    assert vibe and vibe["search_queries"] == ["calm"]
+
+
+def test_start_session_runs_opener_even_when_not_confident():
+    from agentic_dj.spotify.client import SpotifyTrack
+    vibe = {"confident": False, "search_queries": ["calm focus"], "session_label": "Calm",
+            "energy": 0.3, "valence": 0.6, "focus": 0.7, "openness": 0.7, "social": 0.3}
+    track = SpotifyTrack(id="t1", name="Weightless", artist="Marconi Union",
+                         album="", duration_ms=1000, uri="spotify:track:t1")
+    with patch.object(loop_module, "_interpret_description", return_value=vibe), \
+         patch.object(loop_module, "_react_pick_opener",
+                      return_value={"name": "Weightless", "artist": "Marconi Union"}) as mock_open, \
+         patch.object(loop_module, "prewarm_embedding_model"), \
+         patch.object(tool_module._spotify, "search", return_value=[track]), \
+         patch.object(tool_module._spotify, "play", return_value=True), \
+         patch.object(tool_module, "_record_played_track", return_value={"name": "Weightless"}):
+        result = loop_module.start_session("calm focus music")
+    assert mock_open.called                 # opener ran despite confident=False
+    assert result["success"] is True
+    assert result["fallback_used"] is False
+
+
+# ── _search_seed_tags() — discovery must follow the playing track ───────────────
+
+def test_seed_tags_are_on_genre_from_current_track():
+    state = {"energy": 0.5, "valence": 0.5, "arc_phase": "build"}
+    current = {"name": "Callaita", "artist": "Bad Bunny",
+               "tags": ["reggaeton", "latin", "trap"]}
+    seeds = loop_module._search_seed_tags(state, current)
+    assert seeds == ["reggaeton", "latin"]        # both tags on-genre, from the track
+    # crucially, no off-genre state tag (e.g. 'indie') is blended in
+    assert "indie" not in seeds
+
+
+def test_seed_tags_skip_artist_name_tag():
+    state = {"energy": 0.5, "valence": 0.5, "arc_phase": "build"}
+    current = {"name": "Rompe", "artist": "Daddy Yankee",
+               "tags": ["Reggaeton", "Daddy Yankee", "latin"]}
+    # artist-name tag is dropped; next genuine tags are used
+    assert loop_module._search_seed_tags(state, current) == ["reggaeton", "latin"]
+
+
+def test_seed_tags_fall_back_to_state_when_no_current():
+    state = {"energy": 0.5, "valence": 0.5, "arc_phase": "build"}
+    assert loop_module._search_seed_tags(state, None) == loop_module._state_to_tags(state)
+
+
+# ── Session caches — avoid re-resolving / re-enriching the same track ───────────
+
+def test_resolve_cache_dedupes_searches():
+    tool_module.reset_session("general")
+    with patch.object(tool_module._spotify, "search", return_value=[]) as mock_search:
+        for _ in range(3):
+            tool_module._resolve("Amber 311", limit=1)
+    assert mock_search.call_count == 1
+
+
+def test_candidate_cache_dedupes_enrichment():
+    from agentic_dj.spotify.client import SpotifyTrack
+    tool_module.reset_session("general")
+    track = SpotifyTrack(id="abc", name="X", artist="Y", album="",
+                         duration_ms=1000, uri="spotify:track:abc")
+    with patch.object(tool_module._spotify, "is_saved", return_value=False), \
+         patch.object(tool_module, "fetch_enrichment") as mock_enr, \
+         patch.object(tool_module, "fetch_track_info",
+                      return_value={"bpm": None, "camelot_position": None, "found": False}) as mock_sc:
+        mock_enr.return_value.found = False
+        for _ in range(3):
+            tool_module._spotify_to_candidate(track, enrich=True)
+    assert mock_sc.call_count == 1     # Soundcharts hit once, not 3×
+    assert mock_enr.call_count == 1    # Last.fm hit once, not 3×
+
+
+# ── run_agent_cycle() orchestration — graph layer mocked ────────────────────────
+
+def _patch_prefetch_empty():
+    """Make the Python pre-step resolve no candidates (no network)."""
+    return [
+        patch.object(tool_module, "search_tracks_by_tag", return_value={"candidates": []}),
+        patch.object(tool_module, "search_tracks",        return_value={"candidates": []}),
+        # avoid the live Spotify call in the compatibility pre-step
+        patch.object(loop_module, "_current_track_profile", return_value=None),
+        # graph is built lazily; stub the builder + runner so nothing real is constructed
+        patch.object(loop_module, "_get_cycle_graph", return_value=object()),
+    ]
+
 
 def test_run_agent_cycle_return_keys():
-    """run_agent_cycle() must always return the 4 required keys."""
     tool_module.reset_session("general")
+    graph_result = {
+        "queued":      {"success": True, "queued": {"name": "Test Track", "artist": "Test Artist"}},
+        "explanation": "Great pick!",
+        "trace":       [],
+    }
+    patches = _patch_prefetch_empty()
+    patches.append(patch.object(loop_module, "run_graph", return_value=graph_result))
+    for p in patches:
+        p.start()
+    try:
+        result = run_agent_cycle(verbose=False)
+    finally:
+        for p in patches:
+            p.stop()
 
-    queue_response = _make_mock_response(
-        tool_name="add_track_to_queue",
-        tool_args={"track_name": "Test Track", "artist": "Test Artist"},
-        tool_id="c1",
-    )
-    explain_response = _make_mock_response(content="Great pick!")
-
-    with patch.object(loop_module, "client") as mock_client:
-        mock_client.chat.completions.create.side_effect = [queue_response, explain_response]
-        with patch.dict(loop_module.TOOL_REGISTRY, {
-            "add_track_to_queue": lambda track_name, artist: {
-                "success": True,
-                "queued": {"name": track_name, "artist": artist},
-            },
-        }):
-            result = run_agent_cycle(verbose=False)
-
-    assert "explanation"  in result
-    assert "queued_track" in result
-    assert "trace"        in result
-    assert "success"      in result
+    assert set(result) >= {"explanation", "queued_track", "trace", "success"}
+    assert result["success"] is True
+    assert result["queued_track"] == {"name": "Test Track", "artist": "Test Artist"}
 
 
 def test_feedback_applied_before_loop():
-    """update_listener_state must appear at step 0 in the trace when feedback is given."""
     tool_module.reset_session("general")
-
-    queue_response = _make_mock_response(
-        tool_name="add_track_to_queue",
-        tool_args={"track_name": "Next Track", "artist": "Artist"},
-        tool_id="c1",
-    )
-    explain_response = _make_mock_response(content="Done.")
-
-    with patch.object(loop_module, "client") as mock_client:
-        mock_client.chat.completions.create.side_effect = [queue_response, explain_response]
-        with patch.dict(loop_module.TOOL_REGISTRY, {
-            "add_track_to_queue": lambda track_name, artist: {
-                "success": True,
-                "queued": {"name": track_name, "artist": artist},
-            },
-        }):
-            result = run_agent_cycle(
-                feedback_event="skip",
-                feedback_track="Old Track",
-                feedback_artist="Old Artist",
-                verbose=False,
-            )
-
-    tool_names = [t["tool_name"] for t in result["trace"] if t.get("tool_name")]
-    assert "update_listener_state" in tool_names, \
-        f"update_listener_state missing from trace: {tool_names}"
-
-    step0 = next((t for t in result["trace"] if t.get("step") == 0), None)
-    assert step0 is not None, "No step-0 trace entry found"
-    assert step0["tool_name"] == "update_listener_state"
-
-
-# ── Group 4: _run_react_loop() edge cases ─────────────────────────────────────
-
-def test_unknown_tool_graceful():
-    """Groq calling an unknown tool name must not raise — loop returns normally."""
-    tool_module.reset_session("general")
-
-    unknown_response = _make_mock_response(
-        tool_name="nonexistent_tool",
-        tool_args={},
-        tool_id="c1",
-    )
-    final_response = _make_mock_response(content="Recovered gracefully.")
-
-    with patch.object(loop_module, "client") as mock_client:
-        mock_client.chat.completions.create.side_effect = [unknown_response, final_response]
-        result = _run_react_loop(
-            messages=[{"role": "user", "content": "select a track"}],
-            trace=[],
+    graph_result = {
+        "queued":      {"success": True, "queued": {"name": "Next Track", "artist": "Artist"}},
+        "explanation": "Done.",
+        "trace":       [],
+    }
+    patches = _patch_prefetch_empty()
+    patches.append(patch.object(loop_module, "run_graph", return_value=graph_result))
+    for p in patches:
+        p.start()
+    try:
+        result = run_agent_cycle(
+            feedback_event="skip",
+            feedback_track="Old Track",
+            feedback_artist="Old Artist",
+            verbose=False,
         )
+    finally:
+        for p in patches:
+            p.stop()
 
-    assert isinstance(result, dict)
-    assert "queued"      in result
-    assert "explanation" in result
+    # Feedback must be applied (and traced) at step 0, before the graph runs.
+    step0 = next((t for t in result["trace"] if t.get("step") == 0
+                  and t.get("tool_name") == "update_listener_state"), None)
+    assert step0 is not None, f"step-0 update_listener_state missing: {result['trace']}"
 
 
-def test_rate_limit_retries():
-    """A 429/rate_limit exception triggers a retry and time.sleep is called once."""
+def test_run_agent_cycle_falls_back_when_graph_does_not_commit():
+    """If the graph returns no queued track, the scored fallback queues one."""
     tool_module.reset_session("general")
+    # `id` is required — the pre-step dedups candidates on it and drops id-less ones.
+    raw = [{"id": "fb1", "name": "Fallback Pick", "artist": "FB",
+            "energy_est": 0.5, "valence_est": 0.5}]
+    graph_result = {"queued": None, "explanation": "", "trace": []}
 
-    rate_err      = Exception("429 rate_limit exceeded")
-    success_resp  = _make_mock_response(content="Succeeded after retry.")
+    patches = [
+        patch.object(tool_module, "search_tracks_by_tag", return_value={"candidates": raw}),
+        patch.object(tool_module, "search_tracks",        return_value={"candidates": []}),
+        patch.object(loop_module, "_current_track_profile", return_value=None),
+        patch.object(loop_module, "_get_cycle_graph", return_value=object()),
+        patch.object(loop_module, "run_graph", return_value=graph_result),
+        patch.object(tool_module, "add_track_to_queue",
+                     return_value={"success": True, "queued": {"name": "Fallback Pick", "artist": "FB"}}),
+    ]
+    for p in patches:
+        p.start()
+    try:
+        result = run_agent_cycle(verbose=False)
+    finally:
+        for p in patches:
+            p.stop()
 
-    with patch.object(loop_module, "client") as mock_client:
-        with patch.object(loop_module.time, "sleep") as mock_sleep:
-            mock_client.chat.completions.create.side_effect = [rate_err, success_resp]
-            result = _run_react_loop(
-                messages=[{"role": "user", "content": "select a track"}],
-                trace=[],
-            )
-
-    assert mock_client.chat.completions.create.call_count == 2
-    assert mock_sleep.call_count == 1
-    assert result["explanation"] == "Succeeded after retry."
+    assert result["success"] is True
+    assert result["queued_track"]["name"] == "Fallback Pick"

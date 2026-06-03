@@ -25,7 +25,7 @@ delegated to ChatGroq(max_retries=4) — there is no custom _groq_call here.
 import json
 from typing import Annotated, Any, Optional, TypedDict
 
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import AIMessage, ToolMessage
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_groq import ChatGroq
@@ -35,6 +35,19 @@ from langchain_groq import ChatGroq
 # instantiates a Groq client at import time and needs GROQ_API_KEY).
 MODEL: str = "openai/gpt-oss-120b"
 MAX_ITERATIONS: int = 15
+# gpt-oss on Groq intermittently emits a malformed tool call (harmony channel
+# token leaked into the name) that Groq rejects with a 400 `tool_use_failed`.
+# It is sampling-dependent, so re-invoking usually returns a clean call.
+TOOL_RETRY_ATTEMPTS: int = 3
+
+
+def _is_tool_validation_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        "tool_use_failed" in msg
+        or "tool call validation failed" in msg
+        or "<|channel|>" in msg
+    )
 
 
 # ── Graph state ───────────────────────────────────────────────────────────────
@@ -93,11 +106,66 @@ def _message_text(message: Any) -> str:
     return content.strip() if isinstance(content, str) else ""
 
 
+def _clean_tool_name(name: str) -> str:
+    """
+    Strip gpt-oss "harmony" channel tokens / namespace prefixes that Groq
+    sometimes leaks into a tool name, e.g. 'search_tracks<|channel|>commentary'
+    or 'functions.search_tracks'. Without this the tool name does not match the
+    registry (and Groq 400s the call unless disable_tool_validation is set).
+    """
+    if not name:
+        return name
+    name = name.split("<|")[0].strip()        # drop harmony channel suffix
+    if name.startswith("functions."):
+        name = name[len("functions."):]
+    return name
+
+
+def _sanitize_tool_calls(message: Any) -> None:
+    """
+    In-place: clean leaked tokens from tool-call names on both the parsed
+    ``.tool_calls`` and the raw ``additional_kwargs['tool_calls']`` so that
+    execution, the trace, AND the message history sent on the next turn all
+    see the real tool name.
+    """
+    for tc in getattr(message, "tool_calls", None) or []:
+        if isinstance(tc, dict) and tc.get("name"):
+            tc["name"] = _clean_tool_name(tc["name"])
+    raw = (getattr(message, "additional_kwargs", {}) or {}).get("tool_calls")
+    for tc in raw or []:
+        fn = tc.get("function") if isinstance(tc, dict) else None
+        if fn and fn.get("name"):
+            fn["name"] = _clean_tool_name(fn["name"])
+
+
 # ── Shared nodes & routers ──────────────────────────────────────────────────────
+
+def _invoke_with_tool_retry(llm_with_tools, messages):
+    """
+    Invoke the tool-bound LLM, retrying on Groq's `tool_use_failed` 400 (a
+    malformed/corrupted tool call). If every attempt fails, return a tool-less
+    AIMessage so the graph ends gracefully and the Python fallback selects a
+    track — far better than crashing the cycle.
+    """
+    last_exc = None
+    for _ in range(TOOL_RETRY_ATTEMPTS):
+        try:
+            return llm_with_tools.invoke(messages)
+        except Exception as exc:                       # noqa: BLE001
+            if not _is_tool_validation_error(exc):
+                raise
+            last_exc = exc                             # re-sample on next loop
+    return AIMessage(
+        content="",
+        additional_kwargs={"reasoning_content":
+                           f"Tool-call generation failed after retries: {last_exc}"},
+    )
+
 
 def _make_agent_node(llm_with_tools):
     def agent_node(state: DJState) -> dict:
-        response = llm_with_tools.invoke(state["messages"])
+        response = _invoke_with_tool_retry(llm_with_tools, state["messages"])
+        _sanitize_tool_calls(response)   # gpt-oss leaks harmony tokens into tool names
         trace = list(state.get("trace", []))
         step  = state.get("step", 1)
 
@@ -170,7 +238,7 @@ def _make_standard_tools_node(registry: dict, stop_tool: str):
         out_messages = []
 
         for tc in last.tool_calls:
-            name = tc["name"]
+            name = _clean_tool_name(tc["name"])
             args = tc.get("args", {}) or {}
             tool = registry.get(name)
             if tool is None:
@@ -249,7 +317,7 @@ def _make_opener_tools_node(registry: dict, stop_tool: str):
         out_messages = []
 
         for tc in last.tool_calls:
-            name = tc["name"]
+            name = _clean_tool_name(tc["name"])
             args = tc.get("args", {}) or {}
 
             if name == stop_tool:
@@ -295,7 +363,17 @@ def _make_opener_tools_node(registry: dict, stop_tool: str):
 # ── Graph factories ─────────────────────────────────────────────────────────────
 
 def _make_llm(model: str, temperature: float, max_retries: int):
-    return ChatGroq(model=model, temperature=temperature, max_retries=max_retries)
+    # disable_tool_validation: gpt-oss-120b on Groq intermittently leaks a harmony
+    # channel token into the tool name (e.g. 'search_tracks<|channel|>commentary'),
+    # which Groq's server otherwise rejects with a 400 mid-generation. With
+    # validation off the call is returned and we clean the name (_sanitize_tool_calls);
+    # unknown tools are still handled gracefully by the tools node.
+    return ChatGroq(
+        model=model,
+        temperature=temperature,
+        max_retries=max_retries,
+        model_kwargs={"disable_tool_validation": True},
+    )
 
 
 def build_dj_graph(
