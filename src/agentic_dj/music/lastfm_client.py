@@ -204,6 +204,48 @@ def get_similar_artists(artist: str, limit: int = 5, use_cache: bool = True) -> 
     return names
 
 
+def get_similar_tracks(
+    artist:    str,
+    track:     str,
+    limit:     int  = 15,
+    use_cache: bool = True,
+) -> list[dict]:
+    """
+    Return up to `limit` tracks similar to (artist, track) according to Last.fm.
+    This is the strongest continuity signal for choosing the next track — songs
+    listeners actually associate with the current one, not just genre-popular.
+
+    Returns a list of {"name": ..., "artist": ...} dicts, [] if not found / API fails.
+    Disk-cached like all other Last.fm calls.
+    """
+    key = hashlib.sha1(
+        f"similar_track|{artist.lower().strip()}|{track.lower().strip()}".encode("utf-8")
+    ).hexdigest()[:16]
+
+    if use_cache:
+        cached = _read_cache(key)
+        if cached is not None:
+            return cached.get("tracks", [])
+
+    network = _get_network()
+    try:
+        items  = network.get_track(artist, track).get_similar(limit=limit)
+        tracks = [
+            {"name": s.item.title, "artist": s.item.artist.name}
+            for s in items
+            if getattr(s, "item", None)
+            and getattr(s.item, "title", None)
+            and getattr(s.item, "artist", None)
+        ]
+    except pylast.WSError:
+        tracks = []
+
+    if use_cache:
+        _write_cache(key, {"tracks": tracks})
+
+    return tracks
+
+
 def get_top_tracks_for_tag(
     tag:       str,
     limit:     int  = 30,

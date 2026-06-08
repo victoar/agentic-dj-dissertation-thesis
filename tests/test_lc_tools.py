@@ -71,13 +71,15 @@ def test_every_tool_has_a_description(name):
     assert lc_tools.TOOLS_BY_NAME[name].description.strip()
 
 
-def test_cycle_tools_excludes_search():
+def test_cycle_tools_excludes_search_and_adds_ranked():
     cycle_names = {t.name for t in lc_tools.CYCLE_TOOLS}
     search = {"search_tracks_by_tag", "search_artist_tracks",
               "search_tracks", "search_tracks_by_playlist"}
-    assert search.isdisjoint(cycle_names), "cycle tools must not contain search tools"
-    assert cycle_names == set(EXPECTED) - search
-    assert len(lc_tools.CYCLE_TOOLS) == 11
+    assert search.isdisjoint(cycle_names), "cycle tools must not contain granular search tools"
+    assert "get_ranked_candidates" in cycle_names, "cycle must expose the discovery+rank tool"
+    # the 11 non-search tools from ALL_TOOLS, plus get_ranked_candidates
+    assert cycle_names == (set(EXPECTED) - search) | {"get_ranked_candidates"}
+    assert len(lc_tools.CYCLE_TOOLS) == 12
 
 
 def test_search_tracks_does_not_expose_enrich():

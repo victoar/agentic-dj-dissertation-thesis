@@ -1,12 +1,10 @@
 """
-Unit tests for the agent loop (post-LangGraph migration).
+Unit tests for the agent loop + candidate selection (post-refactor).
 
-No external API calls. The graph layer is mocked: run_agent_cycle's Python
-pre-step (Last.fm / Spotify search) and the compiled graph are patched so the
-loop's orchestration — feedback application, trace assembly, fallback, return
-shape — can be tested in isolation.
-
-The ReAct graph engine itself is covered by tests/test_graph.py; the tool
+No external API calls. The compiled graph is mocked so run_agent_cycle's
+orchestration (feedback, trace, fallback, return shape) is tested in isolation.
+Discovery + ranking now live in agent/tools.py (get_ranked_candidates and its
+helpers); the ReAct graph engine is covered by tests/test_graph.py and the tool
 schemas by tests/test_lc_tools.py.
 """
 
@@ -15,71 +13,123 @@ from unittest.mock import patch
 
 import agentic_dj.agent.loop as loop_module
 import agentic_dj.agent.tools as tool_module
-from agentic_dj.agent.loop import _best_fallback, _compatible_pool, run_agent_cycle
+from agentic_dj.agent.tools import (
+    _compatible_pool, _rank_candidates, _seed_tags, _gather_bucket, get_ranked_candidates,
+)
+from agentic_dj.agent.loop import run_agent_cycle
 
 
-# ── _compatible_pool() — hard harmonic + tempo filter (fixes out-of-key picks) ──
+def _cand(name, key, bpm, energy=0.5, valence=0.5, familiar=False):
+    return {"id": name, "name": name, "artist": "A", "camelot_position": key, "bpm": bpm,
+            "energy_est": energy, "valence_est": valence, "familiar": familiar, "tags": []}
 
-def _cand(name, key, bpm, energy=0.5, valence=0.5):
-    return {"id": name, "name": name, "artist": "A", "camelot_position": key,
-            "bpm": bpm, "energy_est": energy, "valence_est": valence}
 
+# ── _compatible_pool() — hard harmonic + tempo filter ───────────────────────────
 
 def test_compatible_pool_drops_incompatible_key():
-    state = {"arc_phase": "build", "energy": 0.5, "valence": 0.5}
+    state = {"arc_phase": "build"}
     cands = [_cand("Good", "1B", 120), _cand("Bad", "6B", 120)]  # from 12B: 1B=0.85, 6B=0.10
-    pool = _compatible_pool(cands, state, current_key="12B", current_bpm=120)
-    names = {c["name"] for c in pool}
+    names = {c["name"] for c in _compatible_pool(cands, state, "12B", 120)}
     assert "Good" in names and "Bad" not in names
 
 
 def test_compatible_pool_drops_out_of_tempo():
-    # warmup → tight 8 BPM window; 142→124 (18 apart) must be excluded.
-    state = {"arc_phase": "warmup", "energy": 0.5, "valence": 0.5}
+    state = {"arc_phase": "warmup"}                              # tight ±8 BPM
     cands = [_cand("Close", "12B", 140), _cand("Far", "12B", 124)]
-    pool = _compatible_pool(cands, state, current_key="12B", current_bpm=142)
-    names = {c["name"] for c in pool}
+    names = {c["name"] for c in _compatible_pool(cands, state, "12B", 142)}
     assert "Close" in names and "Far" not in names
 
 
-def test_compatible_pool_unknown_current_key_keeps_all():
-    state = {"arc_phase": "build", "energy": 0.5, "valence": 0.5}
+def test_compatible_pool_unknown_current_keeps_all():
+    state = {"arc_phase": "build"}
     cands = [_cand("X", "1B", 120), _cand("Y", "6B", 200)]
-    # No current key and no current BPM → cannot filter → keep everything.
-    assert len(_compatible_pool(cands, state, current_key=None, current_bpm=None)) == 2
+    assert len(_compatible_pool(cands, state, None, None)) == 2
 
 
-def test_compatible_pool_never_returns_empty():
-    state = {"arc_phase": "peak", "energy": 0.5, "valence": 0.5}
-    cands = [_cand("OnlyBad", "6B", 124)]  # incompatible on both axes
-    pool = _compatible_pool(cands, state, current_key="12B", current_bpm=142)
-    assert pool == cands   # soft degrade rather than stall
+def test_compatible_pool_never_empty():
+    state = {"arc_phase": "peak"}
+    cands = [_cand("OnlyBad", "6B", 124)]
+    assert _compatible_pool(cands, state, "12B", 142) == cands   # soft degrade
 
 
-# ── _best_fallback() — scored safety net (unchanged by the migration) ───────────
+# ── _rank_candidates() — composite RANK_WEIGHTS ─────────────────────────────────
 
-def test_best_fallback_picks_closest():
-    state = {"energy": 0.8, "valence": 0.7}
-    candidates = [
-        {"name": "Far Track",  "artist": "A", "energy_est": 0.2,  "valence_est": 0.1},
-        {"name": "Near Track", "artist": "B", "energy_est": 0.75, "valence_est": 0.65},
-        {"name": "Mid Track",  "artist": "C", "energy_est": 0.5,  "valence_est": 0.5},
-    ]
-    assert _best_fallback(candidates, state)["name"] == "Near Track"
+def test_rank_prefers_harmonic():
+    state = {"energy": 0.5, "valence": 0.5, "arc_phase": "build", "openness": 0.5}
+    cands = [_cand("Far", "6B", 120), _cand("Smooth", "1B", 120)]   # vs 12B: 0.10 vs 0.85
+    ranked = _rank_candidates(cands, state, "12B", 120)
+    assert ranked[0]["name"] == "Smooth"
 
 
-def test_best_fallback_empty():
-    assert _best_fallback([], {"energy": 0.5, "valence": 0.5}) == {}
+def test_rank_uses_arc_target():
+    # warmup band 0.3–0.5; with target energy 0.65 both are equidistant on ev,
+    # so the arc term decides → the in-band (lower-energy) track wins.
+    state = {"energy": 0.65, "valence": 0.5, "arc_phase": "warmup", "openness": 0.5}
+    cands = [_cand("Calm", None, None, energy=0.5), _cand("Hype", None, None, energy=0.8)]
+    ranked = _rank_candidates(cands, state, None, None)
+    assert ranked[0]["name"] == "Calm"
 
 
-def test_best_fallback_penalizes_bpm_camelot():
-    state = {"energy": 0.5, "valence": 0.5}
-    candidates = [
-        {"name": "Flag Track",    "artist": "A", "energy_est": 0.5, "valence_est": 0.5,
-         "bpm_ok": False, "camelot_ok": False},
-        {"name": "Healthy Track", "artist": "B", "energy_est": 0.6, "valence_est": 0.6},
-    ]
-    assert _best_fallback(candidates, state)["name"] == "Healthy Track"
+def test_rank_openness_flips_familiarity():
+    base = {"energy": 0.5, "valence": 0.5, "arc_phase": "build"}
+    cands = [_cand("Known", None, None, familiar=True), _cand("New", None, None, familiar=False)]
+    high = _rank_candidates(cands, {**base, "openness": 0.9}, None, None)
+    low  = _rank_candidates(cands, {**base, "openness": 0.1}, None, None)
+    assert high[0]["name"] == "New"      # high openness rewards novelty
+    assert low[0]["name"] == "Known"     # low openness rewards familiarity
+
+
+# ── _seed_tags() — on-genre, from the current track ─────────────────────────────
+
+def test_seed_tags_from_current_track():
+    state = {"energy": 0.5, "valence": 0.5, "arc_phase": "build"}
+    current = {"artist": "Bad Bunny", "tags": ["reggaeton", "Bad Bunny", "latin"]}
+    assert _seed_tags(state, current) == ["reggaeton", "latin"]   # artist tag skipped
+
+
+def test_seed_tags_fall_back_to_state():
+    state = {"energy": 0.5, "valence": 0.5, "arc_phase": "build"}
+    assert _seed_tags(state, None) == tool_module._state_to_tags(state)
+
+
+# ── get_ranked_candidates() + _gather_bucket() ──────────────────────────────────
+
+def test_get_ranked_candidates_filters_and_formats():
+    current = {"id": "cur", "name": "Cur", "artist": "C", "camelot_position": "12B", "bpm": 120}
+    bucket = [_cand("Smooth", "1B", 120), _cand("Bad", "6B", 120)]   # Bad is out of key
+    with patch.object(tool_module, "_current_track_profile", return_value=current), \
+         patch.object(tool_module, "_gather_bucket", return_value=bucket):
+        out = get_ranked_candidates(limit=5)
+    names = [c["name"] for c in out["candidates"]]
+    assert names == ["Smooth"]                       # incompatible dropped
+    assert out["candidates"][0]["harmonic_score"] == 0.85
+    assert out["from"]["key"] == "12B"
+
+
+def test_gather_bucket_dedups_and_caps():
+    current = {"id": "cur", "name": "Cur", "artist": "C"}
+    many = {"candidates": [_cand(f"t{i}", "8B", 120) for i in range(30)]}
+    with patch.object(tool_module, "search_similar_tracks", return_value=many), \
+         patch.object(tool_module, "get_similar_artists", return_value=[]), \
+         patch.object(tool_module, "search_tracks_by_tag", return_value={"candidates": []}):
+        bucket = _gather_bucket(current, {"arc_phase": "build"})
+    ids = [c["id"] for c in bucket]
+    assert len(bucket) <= tool_module._BUCKET_SIZE
+    assert len(ids) == len(set(ids))                 # de-duped
+
+
+def test_search_similar_tracks_shape():
+    from agentic_dj.spotify.client import SpotifyTrack
+    tool_module.reset_session("general")
+    sp = SpotifyTrack(id="s1", name="Sim", artist="SimArtist", album="",
+                      duration_ms=1000, uri="spotify:track:s1")
+    with patch.object(tool_module, "get_similar_tracks",
+                      return_value=[{"name": "Sim", "artist": "SimArtist"}]), \
+         patch.object(tool_module, "_resolve", return_value=[sp]), \
+         patch.object(tool_module, "_spotify_to_candidate",
+                      return_value=_cand("Sim", "8B", 120)):
+        res = tool_module.search_similar_tracks("SimArtist", "Sim", limit=5)
+    assert res["count"] == 1 and res["candidates"][0]["name"] == "Sim"
 
 
 # ── start_session opener: interpret robustness + gate ───────────────────────────
@@ -99,7 +149,6 @@ class _FakeLLM:
 
 
 def test_interpret_reads_json_from_reasoning_channel():
-    # gpt-oss puts the JSON on the reasoning channel with empty .content
     msg = _FakeMsg(content="", reasoning='{"energy":0.8,"search_queries":["x"],'
                                          '"session_label":"L","confident":true}')
     with patch.object(loop_module, "_get_interpret_llm", return_value=_FakeLLM(msg)):
@@ -129,37 +178,11 @@ def test_start_session_runs_opener_even_when_not_confident():
          patch.object(tool_module._spotify, "play", return_value=True), \
          patch.object(tool_module, "_record_played_track", return_value={"name": "Weightless"}):
         result = loop_module.start_session("calm focus music")
-    assert mock_open.called                 # opener ran despite confident=False
-    assert result["success"] is True
-    assert result["fallback_used"] is False
+    assert mock_open.called
+    assert result["success"] is True and result["fallback_used"] is False
 
 
-# ── _search_seed_tags() — discovery must follow the playing track ───────────────
-
-def test_seed_tags_are_on_genre_from_current_track():
-    state = {"energy": 0.5, "valence": 0.5, "arc_phase": "build"}
-    current = {"name": "Callaita", "artist": "Bad Bunny",
-               "tags": ["reggaeton", "latin", "trap"]}
-    seeds = loop_module._search_seed_tags(state, current)
-    assert seeds == ["reggaeton", "latin"]        # both tags on-genre, from the track
-    # crucially, no off-genre state tag (e.g. 'indie') is blended in
-    assert "indie" not in seeds
-
-
-def test_seed_tags_skip_artist_name_tag():
-    state = {"energy": 0.5, "valence": 0.5, "arc_phase": "build"}
-    current = {"name": "Rompe", "artist": "Daddy Yankee",
-               "tags": ["Reggaeton", "Daddy Yankee", "latin"]}
-    # artist-name tag is dropped; next genuine tags are used
-    assert loop_module._search_seed_tags(state, current) == ["reggaeton", "latin"]
-
-
-def test_seed_tags_fall_back_to_state_when_no_current():
-    state = {"energy": 0.5, "valence": 0.5, "arc_phase": "build"}
-    assert loop_module._search_seed_tags(state, None) == loop_module._state_to_tags(state)
-
-
-# ── Session caches — avoid re-resolving / re-enriching the same track ───────────
+# ── Session caches ──────────────────────────────────────────────────────────────
 
 def test_resolve_cache_dedupes_searches():
     tool_module.reset_session("general")
@@ -181,98 +204,45 @@ def test_candidate_cache_dedupes_enrichment():
         mock_enr.return_value.found = False
         for _ in range(3):
             tool_module._spotify_to_candidate(track, enrich=True)
-    assert mock_sc.call_count == 1     # Soundcharts hit once, not 3×
-    assert mock_enr.call_count == 1    # Last.fm hit once, not 3×
+    assert mock_sc.call_count == 1 and mock_enr.call_count == 1
 
 
-# ── run_agent_cycle() orchestration — graph layer mocked ────────────────────────
-
-def _patch_prefetch_empty():
-    """Make the Python pre-step resolve no candidates (no network)."""
-    return [
-        patch.object(tool_module, "search_tracks_by_tag", return_value={"candidates": []}),
-        patch.object(tool_module, "search_tracks",        return_value={"candidates": []}),
-        # avoid the live Spotify call in the compatibility pre-step
-        patch.object(loop_module, "_current_track_profile", return_value=None),
-        # graph is built lazily; stub the builder + runner so nothing real is constructed
-        patch.object(loop_module, "_get_cycle_graph", return_value=object()),
-    ]
-
+# ── run_agent_cycle() orchestration — graph mocked ──────────────────────────────
 
 def test_run_agent_cycle_return_keys():
     tool_module.reset_session("general")
-    graph_result = {
-        "queued":      {"success": True, "queued": {"name": "Test Track", "artist": "Test Artist"}},
-        "explanation": "Great pick!",
-        "trace":       [],
-    }
-    patches = _patch_prefetch_empty()
-    patches.append(patch.object(loop_module, "run_graph", return_value=graph_result))
-    for p in patches:
-        p.start()
-    try:
+    graph_result = {"queued": {"success": True, "queued": {"name": "T", "artist": "A"}},
+                    "explanation": "Great pick!", "trace": []}
+    with patch.object(loop_module, "_get_cycle_graph", return_value=object()), \
+         patch.object(loop_module, "run_graph", return_value=graph_result):
         result = run_agent_cycle(verbose=False)
-    finally:
-        for p in patches:
-            p.stop()
-
     assert set(result) >= {"explanation", "queued_track", "trace", "success"}
     assert result["success"] is True
-    assert result["queued_track"] == {"name": "Test Track", "artist": "Test Artist"}
+    assert result["queued_track"] == {"name": "T", "artist": "A"}
 
 
 def test_feedback_applied_before_loop():
     tool_module.reset_session("general")
-    graph_result = {
-        "queued":      {"success": True, "queued": {"name": "Next Track", "artist": "Artist"}},
-        "explanation": "Done.",
-        "trace":       [],
-    }
-    patches = _patch_prefetch_empty()
-    patches.append(patch.object(loop_module, "run_graph", return_value=graph_result))
-    for p in patches:
-        p.start()
-    try:
-        result = run_agent_cycle(
-            feedback_event="skip",
-            feedback_track="Old Track",
-            feedback_artist="Old Artist",
-            verbose=False,
-        )
-    finally:
-        for p in patches:
-            p.stop()
-
-    # Feedback must be applied (and traced) at step 0, before the graph runs.
+    graph_result = {"queued": {"success": True, "queued": {"name": "N", "artist": "A"}},
+                    "explanation": "Done.", "trace": []}
+    with patch.object(loop_module, "_get_cycle_graph", return_value=object()), \
+         patch.object(loop_module, "run_graph", return_value=graph_result):
+        result = run_agent_cycle(feedback_event="skip", feedback_track="Old",
+                                 feedback_artist="Old A", verbose=False)
     step0 = next((t for t in result["trace"] if t.get("step") == 0
                   and t.get("tool_name") == "update_listener_state"), None)
-    assert step0 is not None, f"step-0 update_listener_state missing: {result['trace']}"
+    assert step0 is not None
 
 
-def test_run_agent_cycle_falls_back_when_graph_does_not_commit():
-    """If the graph returns no queued track, the scored fallback queues one."""
+def test_run_agent_cycle_fallback_uses_ranked_candidate():
     tool_module.reset_session("general")
-    # `id` is required — the pre-step dedups candidates on it and drops id-less ones.
-    raw = [{"id": "fb1", "name": "Fallback Pick", "artist": "FB",
-            "energy_est": 0.5, "valence_est": 0.5}]
     graph_result = {"queued": None, "explanation": "", "trace": []}
-
-    patches = [
-        patch.object(tool_module, "search_tracks_by_tag", return_value={"candidates": raw}),
-        patch.object(tool_module, "search_tracks",        return_value={"candidates": []}),
-        patch.object(loop_module, "_current_track_profile", return_value=None),
-        patch.object(loop_module, "_get_cycle_graph", return_value=object()),
-        patch.object(loop_module, "run_graph", return_value=graph_result),
-        patch.object(tool_module, "add_track_to_queue",
-                     return_value={"success": True, "queued": {"name": "Fallback Pick", "artist": "FB"}}),
-    ]
-    for p in patches:
-        p.start()
-    try:
+    with patch.object(loop_module, "_get_cycle_graph", return_value=object()), \
+         patch.object(loop_module, "run_graph", return_value=graph_result), \
+         patch.object(tool_module, "get_ranked_candidates",
+                      return_value={"candidates": [{"name": "Fallback Pick", "artist": "FB"}]}), \
+         patch.object(tool_module, "add_track_to_queue",
+                      return_value={"success": True, "queued": {"name": "Fallback Pick", "artist": "FB"}}):
         result = run_agent_cycle(verbose=False)
-    finally:
-        for p in patches:
-            p.stop()
-
     assert result["success"] is True
     assert result["queued_track"]["name"] == "Fallback Pick"

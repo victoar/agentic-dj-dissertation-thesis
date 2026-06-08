@@ -33,6 +33,8 @@ from agentic_dj.music.lastfm_client import (
     fetch_enrichment,
     get_top_tracks_for_tag,
     get_artist_top_tracks_lastfm,
+    get_similar_tracks,
+    get_similar_artists,
 )
 from agentic_dj.music.soundcharts_client import fetch_track_info
 from agentic_dj.spotify.client import SpotifyClient, SpotifyTrack
@@ -669,6 +671,290 @@ def reset_session(context: str = "general") -> dict:
         "reset":   True,
         "context": context,
         "state":   _state.to_dict(),
+    }
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  CANDIDATE SELECTION  —  discovery bucket + composite ranking
+# ════════════════════════════════════════════════════════════════════════════
+#
+# A single LLM-callable tool (get_ranked_candidates) gathers candidates from
+# several sources into a bucket, hard-filters for harmonic/tempo compatibility
+# with the current track, ranks by a weighted composite, and returns the top N.
+# The same _rank_candidates function backs the loop's safety-net fallback.
+
+# Tunable ranking weights — calibrate these against logged sessions later.
+RANK_WEIGHTS: dict[str, float] = {
+    "ev":          0.35,   # energy/valence fit vs the listener state
+    "harmonic":    0.25,   # Camelot compatibility vs the current track
+    "bpm":         0.15,   # tempo closeness vs the current track
+    "arc":         0.15,   # alignment with the arc-phase energy band
+    "familiarity": 0.10,   # openness-aware familiar/novel preference
+}
+
+# BPM jump tolerance per arc phase (mirrors estimate_bpm_compatibility):
+_BPM_THRESHOLDS = {"warmup": 8.0, "build": 25.0, "peak": 8.0, "cooldown": 25.0}
+_HARMONIC_MIN   = 0.4   # "acceptable" transition (matches check_transition)
+# Arc-phase target energy bands (from the dissertation's session arc).
+_ARC_TARGET = {"warmup": (0.3, 0.5), "build": (0.5, 0.7),
+               "peak": (0.8, 1.0), "cooldown": (0.2, 0.4)}
+
+_BUCKET_SIZE       = 20    # candidates gathered before filtering/ranking
+_SIMILAR_TRACKS_N  = 10    # from Last.fm similar-tracks (primary)
+_SIMILAR_ARTISTS_N = 5     # similar artists, one top track each (secondary)
+
+
+def _arc_energy_target(arc_phase: str) -> tuple[float, float, float]:
+    lo, hi = _ARC_TARGET.get(arc_phase, (0.5, 0.7))
+    return (lo + hi) / 2.0, lo, hi
+
+
+def _state_to_tags(state: dict) -> list[str]:
+    """Map the listener state vector to up to two Last.fm tags (energy/valence/arc)."""
+    energy  = state.get("energy",  0.5)
+    valence = state.get("valence", 0.5)
+    arc     = state.get("arc_phase", "build")
+    tags: list[str] = []
+    if arc == "peak":
+        tags.append("anthemic")
+    elif arc == "cooldown":
+        tags.append("mellow")
+    if energy > 0.65:
+        tags.append("energetic")
+    elif energy < 0.35:
+        tags.append("chill")
+    else:
+        tags.append("indie")
+    if valence > 0.65 and "anthemic" not in tags:
+        tags.append("happy")
+    elif valence < 0.35 and "mellow" not in tags:
+        tags.append("melancholic")
+    return tags[:2] if tags else ["indie"]
+
+
+def _current_track_profile() -> dict | None:
+    """
+    Full enriched profile (tags, camelot_position, bpm, energy/valence) of the
+    track currently playing. Looks it up in session history first; if absent
+    (e.g. the listener changed track directly in Spotify) it is enriched on the
+    fly via get_track_details (cached). None if nothing is playing / unresolved.
+    """
+    playback = get_current_playback()
+    name     = (playback.get("track_name") or "").strip()
+    artist   = (playback.get("artist") or "").strip()
+    if not name:
+        return None
+    for entry in get_session_history().get("recent", []):
+        if entry.get("name", "").lower() == name.lower():
+            return entry
+    details = get_track_details(name, artist)
+    if isinstance(details, dict) and details.get("name") and not details.get("error"):
+        return details
+    return None
+
+
+def _seed_tags(state: dict, current: dict | None) -> list[str]:
+    """Genre tags for the tag-based bucket fill: the current track's top tags
+    (artist-name tag skipped), falling back to state-derived tags."""
+    if current:
+        artist = (current.get("artist") or "").strip().lower()
+        seeds: list[str] = []
+        for t in current.get("tags", []):
+            tl = (t or "").strip().lower()
+            if tl and tl != artist and tl not in seeds:
+                seeds.append(tl)
+            if len(seeds) >= 2:
+                break
+        if seeds:
+            return seeds
+    return _state_to_tags(state)
+
+
+def _compatible_pool(
+    candidates:  list[dict],
+    state:       dict,
+    current_key: str | None,
+    current_bpm: float | None,
+) -> list[dict]:
+    """
+    Hard harmonic + tempo filter vs the current track: keep a candidate if its
+    Camelot key is compatible (strength ≥ 0.4) AND its BPM is within the arc
+    threshold. Unknown values pass (so missing data never empties the pool).
+    Returns the full list unchanged if nothing passes (soft degrade).
+    """
+    threshold = _BPM_THRESHOLDS.get(state.get("arc_phase", "build"), 8.0)
+    from_key  = camelot_parse(current_key) if current_key else None
+
+    def harmonic_ok(c: dict) -> bool:
+        if from_key is None:
+            return True
+        to_key = camelot_parse(c.get("camelot_position") or "")
+        return to_key is None or compatibility_strength(from_key, to_key) >= _HARMONIC_MIN
+
+    def bpm_ok(c: dict) -> bool:
+        cb = c.get("bpm")
+        return not (current_bpm and cb) or abs(current_bpm - cb) <= threshold
+
+    compatible = [c for c in candidates if harmonic_ok(c) and bpm_ok(c)]
+    return compatible if compatible else candidates
+
+
+def _rank_candidates(
+    candidates:  list[dict],
+    state:       dict,
+    current_key: str | None,
+    current_bpm: float | None,
+) -> list[dict]:
+    """
+    Sort candidates best-first by the RANK_WEIGHTS composite: energy/valence fit,
+    harmonic compatibility, BPM closeness, arc-band alignment, and openness-aware
+    familiarity. Unknown key/BPM contribute a neutral 0.5 so missing data does
+    not distort the order.
+    """
+    tgt_e    = state.get("energy",  0.5)
+    tgt_v    = state.get("valence", 0.5)
+    openness = state.get("openness", 0.5)
+    arc      = state.get("arc_phase", "build")
+    _, arc_lo, arc_hi = _arc_energy_target(arc)
+    threshold = _BPM_THRESHOLDS.get(arc, 8.0)
+    from_key  = camelot_parse(current_key) if current_key else None
+
+    def score(c: dict) -> float:
+        e = c.get("energy_est", 0.5)
+        v = c.get("valence_est", 0.5)
+        ev_fit = 1.0 - (abs(e - tgt_e) + abs(v - tgt_v)) / 2.0
+
+        to_key = camelot_parse(c.get("camelot_position") or "")
+        harmonic = compatibility_strength(from_key, to_key) if (from_key and to_key) else 0.5
+
+        cb = c.get("bpm")
+        bpm_close = (1.0 - min(abs(current_bpm - cb) / threshold, 1.0)) if (current_bpm and cb) else 0.5
+
+        if arc_lo <= e <= arc_hi:
+            arc_fit = 1.0
+        else:
+            dist = (arc_lo - e) if e < arc_lo else (e - arc_hi)
+            arc_fit = max(0.0, 1.0 - dist / 0.3)
+
+        familiar = bool(c.get("familiar"))
+        fam_fit = (0.0 if familiar else 1.0) if openness >= 0.5 else (1.0 if familiar else 0.0)
+
+        return (RANK_WEIGHTS["ev"]          * ev_fit
+                + RANK_WEIGHTS["harmonic"]    * harmonic
+                + RANK_WEIGHTS["bpm"]         * bpm_close
+                + RANK_WEIGHTS["arc"]         * arc_fit
+                + RANK_WEIGHTS["familiarity"] * fam_fit)
+
+    return sorted(candidates, key=score, reverse=True)
+
+
+def search_similar_tracks(artist: str, track: str, limit: int = 15) -> dict:
+    """
+    Resolve Last.fm 'similar tracks' for (artist, track) to enriched Spotify
+    candidates — the strongest continuity signal for the next track.
+    Same candidate shape as search_artist_tracks.
+    """
+    raw = get_similar_tracks(artist, track, limit=limit * 2)
+    candidates: list[dict] = []
+    for item in raw:
+        if len(candidates) >= limit:
+            break
+        name        = item.get("name", "")
+        item_artist = item.get("artist", "")
+        if not name:
+            continue
+        results = _resolve(f"{name} {item_artist}", limit=1)
+        if not results:
+            continue
+        sp = results[0]
+        if sp.id in _queued_ids or sp.name.lower() in _queued_names:
+            continue
+        candidates.append(_spotify_to_candidate(sp, enrich=True))
+    return {"track": track, "artist": artist, "count": len(candidates), "candidates": candidates}
+
+
+def _gather_bucket(current: dict | None, state: dict) -> list[dict]:
+    """
+    Fill a de-duped bucket (≤ _BUCKET_SIZE) of enriched candidates from, in order:
+    similar tracks to the current track, similar artists' top tracks, then genre
+    tags. Skips already-played tracks and the current track.
+    """
+    bucket: list[dict] = []
+    seen: set[str] = set()
+    current_id = current.get("id") if current else None
+
+    def add(cands: list[dict]) -> bool:
+        for c in cands:
+            cid = c.get("id")
+            if not cid or cid in seen or cid in _queued_ids or cid == current_id:
+                continue
+            seen.add(cid)
+            bucket.append(c)
+            if len(bucket) >= _BUCKET_SIZE:
+                return True
+        return False
+
+    if current:
+        if add(search_similar_tracks(current.get("artist", ""), current.get("name", ""),
+                                     limit=_SIMILAR_TRACKS_N).get("candidates", [])):
+            return bucket
+        for art in get_similar_artists(current.get("artist", ""), limit=_SIMILAR_ARTISTS_N):
+            if add(search_artist_tracks(art, limit=1).get("candidates", [])):
+                return bucket
+
+    for tag in _seed_tags(state, current):
+        if add(search_tracks_by_tag(tag, limit=10).get("candidates", [])):
+            return bucket
+    return bucket
+
+
+def get_ranked_candidates(limit: int = 5) -> dict:
+    """
+    Find the best next-track options for the current session.
+
+    Gathers candidates from several sources (tracks similar to what's playing,
+    similar artists, and genre tags), keeps only those harmonically and tempo
+    compatible with the current track, ranks them by fit to the listener state
+    and session arc, and returns the top `limit` (default 5).
+
+    Call this once at the start of a cycle, then pick the best candidate and
+    queue it with add_track_to_queue. Each returned candidate includes its key,
+    BPM, energy, valence, tags, and harmonic_score relative to the current track.
+    """
+    state       = _state.to_dict()
+    current     = _current_track_profile()
+    current_key = current.get("camelot_position") if current else None
+    current_bpm = current.get("bpm") if current else None
+
+    bucket = _gather_bucket(current, state)
+    pool   = _compatible_pool(bucket, state, current_key, current_bpm)
+    ranked = _rank_candidates(pool, state, current_key, current_bpm)[:max(1, limit)]
+
+    from_key = camelot_parse(current_key) if current_key else None
+    out: list[dict] = []
+    for c in ranked:
+        to_key = camelot_parse(c.get("camelot_position") or "")
+        harm   = round(compatibility_strength(from_key, to_key), 2) if (from_key and to_key) else None
+        out.append({
+            "name":           c.get("name"),
+            "artist":         c.get("artist"),
+            "key":            c.get("camelot_position"),
+            "bpm":            c.get("bpm"),
+            "energy":         round(c.get("energy_est", 0.5), 2),
+            "valence":        round(c.get("valence_est", 0.5), 2),
+            "harmonic_score": harm,
+            "tags":           c.get("tags", [])[:3],
+        })
+
+    if DISPLAY_LOGS:
+        print(f"  [ranked] bucket={len(bucket)} compatible={len(pool)} → top {len(out)}"
+              f" (from key={current_key or '?'} bpm={current_bpm or '?'})")
+
+    return {
+        "from":       {"name": current.get("name") if current else None,
+                       "key": current_key, "bpm": current_bpm},
+        "count":      len(out),
+        "candidates": out,
     }
 
 

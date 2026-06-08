@@ -162,6 +162,12 @@ def add_track_to_queue(track_name: str, artist: str) -> dict:
     return tool_module.add_track_to_queue(track_name, artist)
 
 
+@tool
+def get_ranked_candidates(limit: int = 5) -> dict:
+    """Find the best next-track options for the current session. Gathers candidates similar to what's playing (similar tracks, similar artists) plus genre matches, keeps only those harmonically and tempo compatible with the current track, ranks them by fit to the listener state and session arc, and returns the top `limit` (default 5). Call this once, then pick one and queue it with add_track_to_queue. Each candidate includes key, BPM, energy, valence, tags, and harmonic_score vs the current track."""
+    return tool_module.get_ranked_candidates(limit)
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  EXPORTED TOOL LISTS
 # ════════════════════════════════════════════════════════════════════════════
@@ -193,8 +199,10 @@ ALL_TOOLS = [
     add_track_to_queue,
 ]
 
-#: Focused subset for run_agent_cycle — no search tools.
-CYCLE_TOOLS = [t for t in ALL_TOOLS if t.name not in _SEARCH_TOOL_NAMES]
+#: Focused subset for run_agent_cycle: the granular search tools are dropped
+#: (the single get_ranked_candidates tool subsumes them — it gathers, filters,
+#: and ranks in one call) and get_ranked_candidates is added.
+CYCLE_TOOLS = [t for t in ALL_TOOLS if t.name not in _SEARCH_TOOL_NAMES] + [get_ranked_candidates]
 
 #: name -> tool object, for execution inside the custom tools node.
 TOOLS_BY_NAME = {t.name: t for t in ALL_TOOLS}
