@@ -533,7 +533,7 @@ def get_current_playback() -> dict:
 _queued_ids:   set[str] = set()    # track ids queued this session — never repeat
 _queued_names: set[str] = set()    # lowercase names as backup when id is unavailable
 
-def add_track_to_queue(track_name: str, artist: str) -> dict:
+def add_track_to_queue(track_name: str, artist: str, reason: str = "") -> dict:
     """
     Search for a track and add it to the Spotify playback queue.
 
@@ -544,6 +544,9 @@ def add_track_to_queue(track_name: str, artist: str) -> dict:
     Args:
         track_name: exact or approximate track title
         artist:     artist name
+        reason:     one sentence explaining the choice, referencing a listener-state
+                    or arc signal and a musical property (key/BPM/energy). Surfaced
+                    to the listener as the agent's explanation.
 
     Returns success status and the track that was queued.
     """
@@ -589,6 +592,7 @@ def add_track_to_queue(track_name: str, artist: str) -> dict:
             "success":    True,
             "queued":     candidate,
             "queue_size": len(_queue),
+            "reason":     reason,   # the agent's one-line justification → explanation
         }
     else:
         return {
@@ -699,9 +703,9 @@ _HARMONIC_MIN   = 0.4   # "acceptable" transition (matches check_transition)
 _ARC_TARGET = {"warmup": (0.3, 0.5), "build": (0.5, 0.7),
                "peak": (0.8, 1.0), "cooldown": (0.2, 0.4)}
 
-_BUCKET_SIZE       = 20    # candidates gathered before filtering/ranking
-_SIMILAR_TRACKS_N  = 10    # from Last.fm similar-tracks (primary)
-_SIMILAR_ARTISTS_N = 5     # similar artists, one top track each (secondary)
+_BUCKET_SIZE       = 12    # candidates enriched + ranked each cycle
+_SIMILAR_TRACKS_N  = 12    # from Last.fm similar-tracks (primary)
+_SIMILAR_ARTISTS_N = 4     # similar artists, one top track each (secondary)
 
 
 def _arc_energy_target(arc_phase: str) -> tuple[float, float, float]:
@@ -877,7 +881,8 @@ def _gather_bucket(current: dict | None, state: dict) -> list[dict]:
     """
     Fill a de-duped bucket (≤ _BUCKET_SIZE) of enriched candidates from, in order:
     similar tracks to the current track, similar artists' top tracks, then genre
-    tags. Skips already-played tracks and the current track.
+    tags. Candidates are resolved + enriched one by one (serial). Skips
+    already-played tracks and the current track.
     """
     bucket: list[dict] = []
     seen: set[str] = set()

@@ -189,41 +189,25 @@ def _make_agent_node(llm_with_tools):
     return agent_node
 
 
-def _make_explain_node(llm):
-    def explain_node(state: DJState) -> dict:
-        trace = list(state.get("trace", []))
-        step  = state.get("step", 1)
-        try:
-            response = llm.invoke(state["messages"])        # no tools bound
-            explanation = _message_text(response) or _extract_reasoning(response)
-        except Exception:                                    # noqa: BLE001
-            explanation = ""                                 # caller synthesises a fallback
-        if explanation:
-            trace.append(_trace_entry(step, "explain", explanation))
-            step += 1
-        return {"trace": trace, "step": step, "explanation": explanation}
-    return explain_node
-
-
 def _route_after_agent(state: DJState) -> str:
     last = state["messages"][-1]
     return "tools" if getattr(last, "tool_calls", None) else END
 
 
 def _route_after_tools(state: DJState) -> str:
-    return "explain" if state.get("terminal") else "agent"
+    # Terminal (stop tool succeeded) → END. The explanation is the `reason` the
+    # model passed at commit (no separate explain turn). Otherwise loop back.
+    return END if state.get("terminal") else "agent"
 
 
-def _assemble(llm, llm_with_tools, tools_node):
-    """Wire the shared agent/explain nodes + routers around a given tools node."""
+def _assemble(llm_with_tools, tools_node):
+    """Wire the shared agent node + routers around a given tools node."""
     g = StateGraph(DJState)
     g.add_node("agent", _make_agent_node(llm_with_tools))
     g.add_node("tools", tools_node)
-    g.add_node("explain", _make_explain_node(llm))
     g.add_edge(START, "agent")
     g.add_conditional_edges("agent", _route_after_agent, {"tools": "tools", END: END})
-    g.add_conditional_edges("tools", _route_after_tools, {"explain": "explain", "agent": "agent"})
-    g.add_edge("explain", END)
+    g.add_conditional_edges("tools", _route_after_tools, {"agent": "agent", END: END})
     return g.compile()
 
 
@@ -234,7 +218,8 @@ def _make_standard_tools_node(registry: dict, stop_tool: str):
         last  = state["messages"][-1]
         trace = list(state.get("trace", []))
         step  = state.get("step", 1)
-        terminal = state.get("terminal")
+        terminal    = state.get("terminal")
+        explanation = state.get("explanation", "")
         out_messages = []
 
         for tc in last.tool_calls:
@@ -260,8 +245,14 @@ def _make_standard_tools_node(registry: dict, stop_tool: str):
 
             if name == stop_tool and isinstance(result, dict) and result.get("success"):
                 terminal = result
+                # The committing turn carries its own explanation via `reason`.
+                if result.get("reason"):
+                    explanation = result["reason"]
+                    trace.append(_trace_entry(step, "explain", explanation))
+                    step += 1
 
-        return {"messages": out_messages, "trace": trace, "step": step, "terminal": terminal}
+        return {"messages": out_messages, "trace": trace, "step": step,
+                "terminal": terminal, "explanation": explanation}
     return tools_node
 
 
@@ -362,40 +353,49 @@ def _make_opener_tools_node(registry: dict, stop_tool: str):
 
 # ── Graph factories ─────────────────────────────────────────────────────────────
 
-def _make_llm(model: str, temperature: float, max_retries: int):
+def _make_llm(model: str, temperature: float, max_retries: int,
+              reasoning_effort: str | None = None):
     # disable_tool_validation: gpt-oss-120b on Groq intermittently leaks a harmony
     # channel token into the tool name (e.g. 'search_tracks<|channel|>commentary'),
     # which Groq's server otherwise rejects with a 400 mid-generation. With
     # validation off the call is returned and we clean the name (_sanitize_tool_calls);
     # unknown tools are still handled gracefully by the tools node.
-    return ChatGroq(
+    # reasoning_effort (low/medium/high) tunes how long gpt-oss "thinks" per turn.
+    # It is an explicit ChatGroq field, so it must be passed directly — NOT via
+    # model_kwargs (which is only for non-field passthrough like disable_tool_validation).
+    kwargs: dict = dict(
         model=model,
         temperature=temperature,
         max_retries=max_retries,
         model_kwargs={"disable_tool_validation": True},
     )
+    if reasoning_effort:
+        kwargs["reasoning_effort"] = reasoning_effort
+    return ChatGroq(**kwargs)
 
 
 def build_dj_graph(
-    tools:       list,
-    stop_tool:   str,
-    model:       str = MODEL,
-    temperature: float = 0.3,
-    max_retries: int = 4,
+    tools:            list,
+    stop_tool:        str,
+    model:            str = MODEL,
+    temperature:      float = 0.3,
+    max_retries:      int = 4,
+    reasoning_effort: str | None = None,
 ):
     """Compile the mid-session cycle graph (stops on ``stop_tool`` success)."""
-    llm = _make_llm(model, temperature, max_retries)
+    llm = _make_llm(model, temperature, max_retries, reasoning_effort)
     registry = {t.name: t for t in tools}
-    return _assemble(llm, llm.bind_tools(tools),
+    return _assemble(llm.bind_tools(tools),
                      _make_standard_tools_node(registry, stop_tool))
 
 
 def build_opener_graph(
-    tools:       list,
-    stop_tool:   str = "select_opening_track",
-    model:       str = MODEL,
-    temperature: float = 0.3,
-    max_retries: int = 4,
+    tools:            list,
+    stop_tool:        str = "select_opening_track",
+    model:            str = MODEL,
+    temperature:      float = 0.3,
+    max_retries:      int = 4,
+    reasoning_effort: str | None = None,
 ):
     """
     Compile the natural-language session-start graph. ``tools`` should be the
@@ -403,9 +403,9 @@ def build_opener_graph(
     tool's body is never executed — the opener tools node validates the choice
     against ``seen_tracks`` in graph state.
     """
-    llm = _make_llm(model, temperature, max_retries)
+    llm = _make_llm(model, temperature, max_retries, reasoning_effort)
     registry = {t.name: t for t in tools}
-    return _assemble(llm, llm.bind_tools(tools),
+    return _assemble(llm.bind_tools(tools),
                      _make_opener_tools_node(registry, stop_tool))
 
 

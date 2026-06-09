@@ -157,9 +157,9 @@ def get_session_history() -> dict:
 
 
 @tool
-def add_track_to_queue(track_name: str, artist: str) -> dict:
-    """Add a track to the Spotify playback queue. This is the terminal action — call it once with the single best candidate."""
-    return tool_module.add_track_to_queue(track_name, artist)
+def add_track_to_queue(track_name: str, artist: str, reason: str = "") -> dict:
+    """Add a track to the Spotify playback queue. This is the terminal action — call it once with the single best candidate. Pass `reason`: one sentence explaining why this track, referencing a listener-state or arc signal AND a musical property (key/BPM/energy). This becomes the explanation shown to the listener."""
+    return tool_module.add_track_to_queue(track_name, artist, reason)
 
 
 @tool

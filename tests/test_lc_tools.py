@@ -37,7 +37,7 @@ EXPECTED: dict[str, tuple[set[str], set[str]]] = {
     "get_current_playback":       (set(), set()),
     "get_queue_state":            (set(), set()),
     "get_session_history":        (set(), set()),
-    "add_track_to_queue":         ({"track_name", "artist"}, {"track_name", "artist"}),
+    "add_track_to_queue":         ({"track_name", "artist", "reason"}, {"track_name", "artist"}),
 }
 
 

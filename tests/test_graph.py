@@ -52,9 +52,9 @@ def check_transition(from_camelot: str, to_camelot: str) -> dict:
 
 
 @tool
-def add_track_to_queue(track_name: str, artist: str) -> dict:
+def add_track_to_queue(track_name: str, artist: str, reason: str = "") -> dict:
     """Terminal action: queue a track."""
-    return {"success": True, "queued": {"name": track_name, "artist": artist}}
+    return {"success": True, "queued": {"name": track_name, "artist": artist}, "reason": reason}
 
 
 TOOLS = [check_transition, add_track_to_queue]
@@ -71,30 +71,29 @@ def _ai_tool_call(name, args, call_id, reasoning=""):
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
 def test_react_loop_reaches_stop_tool_and_explains():
+    # No separate explain turn: the explanation is the `reason` passed at commit.
     FakeChatGroq.script = [
         _ai_tool_call("check_transition", {"from_camelot": "8B", "to_camelot": "9B"},
                       "c1", reasoning="Both minor, one step — smooth."),
-        _ai_tool_call("add_track_to_queue", {"track_name": "Time", "artist": "Pink Floyd"},
+        _ai_tool_call("add_track_to_queue",
+                      {"track_name": "Time", "artist": "Pink Floyd",
+                       "reason": "Warmup arc + smooth 8B→9B keeps the energy building."},
                       "c2", reasoning="Commit the top candidate."),
-        AIMessage(content="Queued 'Time' by Pink Floyd — smooth 8B→9B step keeps the build going."),
     ]
     graph = graph_mod.build_dj_graph(TOOLS, stop_tool="add_track_to_queue")
     out = graph_mod.run_graph(graph, [HumanMessage("Pick the next track.")])
 
-    # Terminal result captured from the stop tool
-    assert out["queued"] == {"success": True, "queued": {"name": "Time", "artist": "Pink Floyd"}}
-    assert "Pink Floyd" in out["explanation"]
+    assert out["queued"]["success"] is True
+    assert out["explanation"] == "Warmup arc + smooth 8B→9B keeps the energy building."
 
     kinds = [e["kind"] for e in out["trace"]]
-    assert kinds.count("think") == 2          # reasoning_content captured on both action turns
+    assert kinds.count("think") == 2          # reasoning captured on both action turns
     assert kinds.count("act") == 2            # check_transition + add_track_to_queue
-    assert kinds.count("explain") == 1        # final tool-less turn
+    assert kinds.count("explain") == 1        # the `reason` recorded at commit
 
-    # Trace entry shape matches what bridge.adapt_trace() consumes
     for e in out["trace"]:
         assert set(e) == {"step", "kind", "content", "tool_name", "tool_args", "tool_result"}
 
-    # The act entries name the tools and carry their results
     acts = [e for e in out["trace"] if e["kind"] == "act"]
     assert {a["tool_name"] for a in acts} == {"check_transition", "add_track_to_queue"}
     assert acts[0]["tool_result"]["verdict"] == "smooth"
@@ -199,14 +198,13 @@ def test_opener_commits_a_seen_track():
                       reasoning="Search 2016 pop playlists."),
         _ai_tool_call("select_opening_track",
                       {"track_name": "Closer", "artist": "The Chainsmokers"}, "s2"),
-        AIMessage(content="Opening with 'Closer' — peak-2016 pop to set the vibe."),
     ]
     graph = graph_mod.build_opener_graph(_opener_tools(), stop_tool="select_opening_track")
     out = graph_mod.run_graph(graph, [HumanMessage("2016 clubbing vibes")], max_iterations=8)
 
+    # The opener's explanation is built by start_session, not the graph.
     assert out["choice"] == {"name": "Closer", "artist": "The Chainsmokers"}
     assert out["queued"]["success"] is True
-    assert "Closer" in out["explanation"]
 
 
 def test_opener_rejects_unseen_track():

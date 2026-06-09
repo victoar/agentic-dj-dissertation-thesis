@@ -52,6 +52,9 @@ MODEL  = "openai/gpt-oss-120b"
 
 DISPLAY_LOGS: bool = True       # set False to silence the trace stream
 MAX_ITERATIONS: int = 15        # safety cap per ReAct loop (graph recursion limit)
+# gpt-oss reasoning effort for the mid-session cycle. "medium" keeps the trace
+# rich enough for the failure taxonomy while cutting latency vs the default.
+CYCLE_REASONING_EFFORT: str = "medium"
 
 # Rate-limit backoff is handled natively by ChatGroq(max_retries=...) inside the
 # compiled graphs (graph.py) — there is no custom retry layer here.
@@ -73,27 +76,28 @@ def _get_interpret_llm():
 # ══════════════════════════════════════════════════════════════════════════════
 
 CYCLE_SYSTEM_PROMPT = """\
-You are the reasoning core of an Agentic DJ.
+You are the reasoning core of an Agentic DJ. Your job is to REASON about which
+track best continues the session, then queue it.
 
-Goal: choose the single best next track and queue it. Explain your choice in
-one or two plain sentences.
-
-Tool call order (stay within this):
-  1. get_ranked_candidates()                      — gather the top compatible options
-  2. (optional) check_transition(from_camelot, to_camelot) — confirm the harmonic fit
-  3. add_track_to_queue(track_name, artist)       — TERMINAL: call once, then stop
+Tool call order:
+  1. get_ranked_candidates()                      — get the top compatible options
+  2. (optional) check_transition / get_compatible_keys — only if you are unsure
+     about a borderline pick; the candidates are already pre-screened compatible
+  3. add_track_to_queue(track_name, artist, reason) — TERMINAL: call once, stop
 
 get_ranked_candidates returns up to 5 options already filtered to be harmonically
-and tempo compatible with the current track and ranked best-first by fit to the
-listener state and session arc. Each option includes its key, BPM, energy,
-valence, tags, and harmonic_score. Work ONLY from this list — do not invent
-tracks. Normally commit candidate #1; only move down the list if you have a
-concrete musical reason.
+and tempo compatible with the current track, ranked best-first by fit to the
+listener state and session arc. Each includes key, BPM, energy, valence, tags,
+and harmonic_score.
 
-Ground every claim in actual tool output — never invent values. Do not queue a
-track already played this session. In your final explanation reference at least
-one concrete signal (arc phase or listener state dimension) and one musical
-property (key, BPM, or energy)."""
+Choose deliberately: candidate #1 is usually best, but actively weigh the options
+against the current arc phase, energy/valence, and openness — pick a lower-ranked
+candidate when it genuinely fits the moment better, and say why. Work ONLY from
+this list; never invent tracks or values, and never queue a track already played.
+
+When you commit, pass `reason`: ONE sentence that references a concrete listener
+signal (arc phase or a state dimension) AND a musical property (key, BPM, or
+energy). That sentence is shown to the listener as your explanation."""
 
 
 SESSION_INTERPRET_SYSTEM = "Return only valid JSON. No prose, no markdown fences."
@@ -165,7 +169,11 @@ def _get_cycle_graph():
     """Return the compiled mid-session cycle graph (CYCLE_TOOLS), building it once."""
     global _CYCLE_GRAPH
     if _CYCLE_GRAPH is None:
-        _CYCLE_GRAPH = build_dj_graph(lc_tools.CYCLE_TOOLS, stop_tool="add_track_to_queue")
+        _CYCLE_GRAPH = build_dj_graph(
+            lc_tools.CYCLE_TOOLS,
+            stop_tool="add_track_to_queue",
+            reasoning_effort=CYCLE_REASONING_EFFORT,
+        )
     return _CYCLE_GRAPH
 
 

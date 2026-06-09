@@ -114,7 +114,7 @@ def test_gather_bucket_dedups_and_caps():
          patch.object(tool_module, "search_tracks_by_tag", return_value={"candidates": []}):
         bucket = _gather_bucket(current, {"arc_phase": "build"})
     ids = [c["id"] for c in bucket]
-    assert len(bucket) <= tool_module._BUCKET_SIZE
+    assert len(bucket) == tool_module._BUCKET_SIZE   # capped at 12
     assert len(ids) == len(set(ids))                 # de-duped
 
 
