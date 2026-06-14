@@ -9,3 +9,4 @@ __pycache__/
 .cache_getsongkey/
 .cache_soundcharts/
 streamlit_interface/
+chapter6_schemas/

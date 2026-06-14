@@ -37,6 +37,26 @@ if not st.session_state.get("initialised"):
     )
     st.stop()
 
+# ── Evaluation session panel (§6.4 logging) ──────────────────────────────────
+with st.expander("🔬 Evaluation session (§6.4)", expanded=False):
+    col_pid, col_cond = st.columns(2)
+    with col_pid:
+        pid = st.text_input("Participant ID", value="P1", key="eval_pid")
+    with col_cond:
+        cond = st.selectbox("Condition", ["agenticdj", "spotify"], key="eval_cond")
+
+    if st.button("Set session info", key="eval_set"):
+        bridge.init_eval_logging(pid, cond)
+        st.success(f"Logging active: {pid} / {cond}")
+
+    st.divider()
+    if st.button("💾 End session & save log", key="eval_save", type="primary"):
+        path = bridge.save_session_log(force=True)
+        if path:
+            st.success(f"Log saved → `{path.name}`")
+        else:
+            st.warning("No cycles recorded yet.")
+
 tab_now, tab_state, tab_queue, tab_trace = st.tabs([
     "Now playing", "Listener state", "Queue", "Agent trace"
 ])

@@ -6,10 +6,15 @@ Handles:
   - Session state initialisation
   - Adapters that map tool output to component field names
   - Feedback handler that runs the agent cycle and refreshes state
+  - Session logging for Chapter 6 evaluation (§6.4)
 """
 
-import sys
+import atexit
+import json
 import os
+import sys
+from datetime import datetime
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
@@ -21,6 +26,165 @@ try:
     _agent_available = True
 except Exception:
     _agent_available = False
+
+
+# ── Session-log accumulator (module-level — persists across Streamlit reruns) ─
+
+_LOG_DIR = Path(__file__).resolve().parent.parent / "chapter6_schemas" / "session_logs"
+
+# Mutable module-level state for the current evaluation session
+_eval: dict = {
+    "participant_id": "",
+    "condition":      "",          # "agenticdj" | "spotify"
+    "session_label":  "",
+    "started_at":     "",
+    "cycles":         [],          # list of per-cycle dicts {trace, queued_track}
+}
+
+
+def init_eval_logging(participant_id: str, condition: str) -> None:
+    """Call once when participant + condition are known (from the UI form)."""
+    _eval["participant_id"] = participant_id.strip()
+    _eval["condition"]      = condition.strip()
+    _eval["started_at"]     = datetime.now().isoformat(timespec="seconds")
+    _eval["cycles"]         = []
+
+
+def _accumulate_cycle(result: dict) -> None:
+    """Append one agent-cycle result to the module-level accumulator."""
+    _eval["cycles"].append({
+        "trace":        result.get("trace", []),
+        "queued_track": result.get("queued_track"),
+        "explanation":  result.get("explanation", ""),
+        "success":      result.get("success", False),
+    })
+
+
+# ── Metrics derivation ────────────────────────────────────────────────────────
+
+_ARC_TARGET   = {"warmup": (0.3, 0.5), "build": (0.5, 0.7),
+                 "peak": (0.8, 1.0), "cooldown": (0.2, 0.4)}
+_ARC_THRESHOLDS = {
+    "warmup":   4,
+    "build":    12,   # warmup(4) + build(8)
+    "peak":     16,   # warmup(4) + build(8) + peak(4)
+}
+
+
+def _phase_for_position(pos: int) -> str:
+    """Return the expected arc phase for the N-th track (1-indexed)."""
+    if pos <= _ARC_THRESHOLDS["warmup"]:
+        return "warmup"
+    if pos <= _ARC_THRESHOLDS["build"]:
+        return "build"
+    if pos <= _ARC_THRESHOLDS["peak"]:
+        return "peak"
+    return "cooldown"
+
+
+def _compute_metrics(all_traces: list[list[dict]]) -> dict:
+    """Derive the four §6.4 trace features from the accumulated cycle traces."""
+    n_state_updates        = 0
+    n_constraint_violations = 0
+
+    flat = [entry for cycle in all_traces for entry in cycle]
+
+    for entry in flat:
+        tool = entry.get("tool_name") or ""
+        if tool == "update_listener_state":
+            n_state_updates += 1
+        if tool == "check_transition":
+            result = entry.get("tool_result") or {}
+            if isinstance(result.get("score"), (int, float)) and result["score"] < 0.4:
+                n_constraint_violations += 1
+
+    # Arc deviation — compare each committed track's energy to its expected band
+    history = []
+    if _agent_available:
+        try:
+            history = tool_module.get_session_history().get("recent", [])
+        except Exception:
+            pass
+
+    deviations = []
+    for i, track in enumerate(reversed(history), start=1):  # reversed → chronological
+        phase = _phase_for_position(i)
+        lo, hi = _ARC_TARGET[phase]
+        e = track.get("energy_est", 0.5)
+        dist = max(0.0, lo - e, e - hi)
+        deviations.append(dist)
+
+    arc_deviation       = round(sum(deviations) / len(deviations), 4) if deviations else 0.0
+    session_length_tracks = len(history)
+
+    return {
+        "session_length_tracks":  session_length_tracks,
+        "n_state_updates":         n_state_updates,
+        "n_constraint_violations": n_constraint_violations,
+        "arc_deviation":           arc_deviation,
+    }
+
+
+# ── Save / load ───────────────────────────────────────────────────────────────
+
+def save_session_log(force: bool = False) -> Path | None:
+    """
+    Compute metrics from accumulated traces and write a JSON log to
+    chapter6_schemas/session_logs/.
+
+    Returns the saved file path, or None if skipped (no cycles recorded
+    and force=False).
+    """
+    if not _eval["cycles"] and not force:
+        return None
+
+    all_traces = [c["trace"] for c in _eval["cycles"]]
+    metrics    = _compute_metrics(all_traces)
+
+    pid   = _eval["participant_id"] or "unknown"
+    cond  = _eval["condition"]      or "unknown"
+    ts    = datetime.now().strftime("%Y%m%d_%H%M%S")
+    fname = f"{pid}_{cond}_{ts}.json"
+
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = _LOG_DIR / fname
+
+    payload = {
+        "session_id":     f"{pid}_{cond}_{ts}",
+        "participant_id": pid,
+        "condition":      cond,
+        "session_label":  _eval.get("session_label", ""),
+        "started_at":     _eval.get("started_at", ""),
+        "saved_at":       datetime.now().isoformat(timespec="seconds"),
+        "metrics":        metrics,
+        "history":        [],
+        "cycles":         _eval["cycles"],
+    }
+
+    # Attach full session history
+    if _agent_available:
+        try:
+            payload["history"] = tool_module.get_session_history().get("recent", [])
+        except Exception:
+            pass
+
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False, default=str)
+
+    return out_path
+
+
+def _atexit_save() -> None:
+    """Auto-save on process exit (handles Ctrl+C / Option+C cleanly)."""
+    try:
+        path = save_session_log(force=False)
+        if path:
+            print(f"\n[session-log] auto-saved → {path}")
+    except Exception as e:
+        print(f"\n[session-log] auto-save failed: {e}")
+
+
+atexit.register(_atexit_save)
 
 
 def init_session() -> None:
@@ -89,13 +253,17 @@ def start_session_from_description(description: str) -> dict:
     """Interpret a natural language description, start playback, and fill the buffer."""
     result = start_session(description, verbose=False)
     if result.get("success"):
-        st.session_state.session_label    = result.get("session_label", "")
+        label = result.get("session_label", "")
+        st.session_state.session_label    = label
         st.session_state.start_status     = "idle"
         st.session_state.start_error      = ""
         # Surface the opener's reasoning/trace so the Now Playing + Agent Trace
         # tabs show why the first track was chosen (handle_feedback does the same).
         st.session_state.last_explanation = result.get("explanation", "")
         st.session_state.last_trace       = result.get("trace", [])
+        # Accumulate for session log
+        _eval["session_label"] = label
+        _accumulate_cycle(result)
         refresh()
         ensure_buffer(2)
     else:
@@ -228,4 +396,5 @@ def handle_feedback(event: str) -> None:
     refresh()
     st.session_state.last_trace       = result.get("trace", [])
     st.session_state.last_explanation = result.get("explanation", "")
+    _accumulate_cycle(result)
     st.rerun()
